@@ -1,15 +1,22 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { HfClip, HfPreview, HfStudio, HfTimeline } from '../types'
+import type { HfClip, HfPreview, HfSelection, HfStudio, HfTimeline } from '../types'
 
-// Cutroom: a HyperFrames cutting-room pane that previews the frame under the playhead,
-// lists the timeline, applies the CLI's own clip edits (trim/split/move/
-// delete/duplicate/undo), pulls the Studio selection, and hands a
-// "change this" request to Claude with the clip + frame context attached.
+// Cutroom: a cutting-room pane for HyperFrames projects.
+//
+// The picture lives in three places at once: HyperFrames Studio in the browser
+// (full fidelity, real playback), a frame thumbnail in this pane (kitty pixels
+// where the terminal has them, half-block cells everywhere else, an Svg on the
+// desktop app), and a snapshot path Claude can read. Studio's selection and
+// time are polled into the pane and attached to every prompt the person types,
+// so "make this bigger" needs no further pointing. Cuts are the HyperFrames
+// CLI's own `timeline` verbs; everything else goes to Claude.
 
 const PANE = 'cutroom'
 const WORK = '.hyperframes/cutroom'
+const RGB_W = 192 // width of the raw strip the terminal thumbnail is built from
+const STEP = 0.5 // seconds between frames while "playing"
 
 const project = atom({ plugin: 'cutroom', key: 'project' } as const, null as string | null)
 const candidates = atom({ plugin: 'cutroom', key: 'candidates' } as const, [] as string[])
@@ -18,10 +25,12 @@ const selected = atom({ plugin: 'cutroom', key: 'selected' } as const, null as s
 const playhead = atom({ plugin: 'cutroom', key: 'playhead' } as const, 0)
 const preview = atom({ plugin: 'cutroom', key: 'preview' } as const, null as HfPreview)
 const studio = atom({ plugin: 'cutroom', key: 'studio' } as const, null as HfStudio)
-const studioUrl = atom({ plugin: 'cutroom', key: 'studioUrl' } as const, null as string | null)
+const selection = atom({ plugin: 'cutroom', key: 'selection' } as const, null as HfSelection)
 const status = atom({ plugin: 'cutroom', key: 'status' } as const, '')
 const busy = atom({ plugin: 'cutroom', key: 'busy' } as const, '')
 const receipts = atom({ plugin: 'cutroom', key: 'receipts' } as const, [] as string[])
+const autoContext = atom({ plugin: 'cutroom', key: 'autoContext' } as const, true)
+const playing = atom({ plugin: 'cutroom', key: 'playing' } as const, false)
 
 type Eng = EngineInterface
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -96,19 +105,22 @@ async function findProjects($: Eng, cwd: string): Promise<string[]> {
   return found
 }
 
-async function openProject($: Eng, dir: string) {
+async function openProject($: Eng, dir: string, openBrowser: boolean) {
   const clean = dir.replace(/\/+$/, '')
   if (!(await isProject($, clean))) return say($, `not a HyperFrames project: ${clean}`)
+  stopPlaying()
   await update($, project, () => clean)
   await update($, selected, () => null)
   await update($, preview, () => null)
   await update($, studio, () => null)
-  await update($, studioUrl, () => null)
+  await update($, selection, () => null)
   await update($, receipts, () => [])
   await update($, playhead, () => 0)
   await $.store.set(`last:${await $.session.cwd()}`, clean)
   await say($, `opened ${base(clean)}`)
-  await refresh($, clean)
+  await loadTimeline($, clean)
+  await ensureStudio($, clean, openBrowser)
+  void capture($, clean, 0)
 }
 
 // ---------- timeline ----------
@@ -141,6 +153,86 @@ async function refresh($: Eng, dir: string) {
   void capture($, dir, await read($, playhead))
 }
 
+// ---------- Studio: server, browser, live selection ----------
+
+let pollTimer: { cancel: () => void } | undefined
+let pollFailures = 0
+let lastSelectionAt: string | null | undefined
+
+const studioOf = (st: Json): HfStudio =>
+  st?.result?.state === 'running' && st.result.serverUrl
+    ? {
+        serverUrl: String(st.result.serverUrl),
+        studioUrl: String(st.result.studioUrl ?? `${st.result.serverUrl}/`).replace('127.0.0.1', 'localhost'),
+        projectName: String(st.result.projectName ?? ''),
+      }
+    : null
+
+async function ensureStudio($: Eng, dir: string, openBrowser: boolean) {
+  let srv = studioOf(json((await run($, dir, ['preview', '--status', '--json'])).stdout))
+  if (!srv) {
+    await working($, 'starting Studio…')
+    const r = await run($, dir, ['preview', '--background', ...(openBrowser ? [] : ['--no-open'])], 90_000)
+    srv = studioOf(json((await run($, dir, ['preview', '--status', '--json'])).stdout))
+    await working($, '')
+    if (!srv) return say($, `Studio did not start: ${tail(r.stderr || r.stdout)}`)
+  } else if (openBrowser) {
+    await openUrl($, srv.studioUrl)
+  }
+  await update($, studio, () => srv)
+  startPolling($, dir)
+}
+
+async function openUrl($: Eng, url: string) {
+  const mac = await $.process.run(['open', url]).catch(() => ({ exitCode: 1 }))
+  if (mac.exitCode !== 0) await $.process.run(['xdg-open', url]).catch(() => undefined)
+}
+
+function startPolling($: Eng, dir: string) {
+  pollTimer?.cancel()
+  pollFailures = 0
+  lastSelectionAt = undefined
+  pollTimer = $.clock.every(1500, () => void pollSelection($, dir))
+}
+
+async function pollSelection($: Eng, dir: string) {
+  const srv = await read($, studio)
+  if (!srv) return pollTimer?.cancel()
+  const url = `${srv.serverUrl}/api/projects/${encodeURIComponent(srv.projectName)}/selection`
+  const r = await $.http.fetch(url).catch(() => null)
+  if (!r?.ok) {
+    if (++pollFailures >= 3) {
+      pollTimer?.cancel()
+      await update($, studio, () => null)
+      await say($, 'Studio stopped — press Open Studio to start it again')
+    }
+    return
+  }
+  pollFailures = 0
+  const j = json(r.text)
+  const updatedAt: string | null = j?.updatedAt ?? null
+  if (updatedAt === lastSelectionAt) return
+  lastSelectionAt = updatedAt
+  const s = j?.selection
+  if (!s) return update($, selection, () => null)
+  const sel: HfSelection = {
+    id: s.target?.id ?? null,
+    hfId: s.target?.hfId ?? null,
+    selector: s.target?.selector ?? null,
+    file: s.sourceFile ?? s.compositionPath ?? null,
+    label: s.label ?? null,
+    text: typeof s.textContent === 'string' ? s.textContent.replace(/\s+/g, ' ').trim().slice(0, 120) : null,
+    time: typeof s.currentTime === 'number' ? s.currentTime : null,
+    updatedAt,
+  }
+  await update($, selection, () => sel)
+  const tl = await read($, timeline)
+  const clip = tl?.clips.find(c => c.id === sel.id) ?? tl?.clips.find(c => sel.file !== null && c.src === sel.file)
+  if (clip) await update($, selected, () => clip.id)
+  if (sel.time !== null) await seek($, dir, sel.time)
+  await say($, `Studio: ${sel.label ?? sel.id ?? sel.selector ?? 'selection'}`)
+}
+
 // ---------- frame preview ----------
 
 function pngSize(b64: string) {
@@ -148,6 +240,59 @@ function pngSize(b64: string) {
   const u32 = (o: number) =>
     ((head.charCodeAt(o) << 24) >>> 0) + (head.charCodeAt(o + 1) << 16) + (head.charCodeAt(o + 2) << 8) + head.charCodeAt(o + 3)
   return { width: u32(16) || 16, height: u32(20) || 9 }
+}
+
+function fromB64(b64: string): Uint8Array {
+  const s = atob(b64)
+  const out = new Uint8Array(s.length)
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i)
+  return out
+}
+
+function toB64(bytes: Uint8Array): string {
+  let s = ''
+  for (let i = 0; i < bytes.length; i += 0x4000) s += String.fromCharCode(...bytes.subarray(i, i + 0x4000))
+  return btoa(s)
+}
+
+/** Half-block cells (▀: top pixel as foreground, bottom pixel as background) box-averaged from the raw rgb strip. */
+function rasterCells(rgb: Uint8Array, srcW: number, srcH: number, cols: number, rows: number): string {
+  const out = new Uint8Array(cols * rows * 12)
+  const dv = new DataView(out.buffer)
+  const pxH = rows * 2
+  const sample = (px: number, py: number) => {
+    const x0 = Math.floor((px * srcW) / cols)
+    const x1 = Math.max(x0 + 1, Math.floor(((px + 1) * srcW) / cols))
+    const y0 = Math.floor((py * srcH) / pxH)
+    const y1 = Math.max(y0 + 1, Math.floor(((py + 1) * srcH) / pxH))
+    let r = 0
+    let g = 0
+    let b = 0
+    let n = 0
+    for (let y = y0; y < y1 && y < srcH; y++) {
+      for (let x = x0; x < x1 && x < srcW; x++) {
+        const i = (y * srcW + x) * 3
+        r += rgb[i] ?? 0
+        g += rgb[i + 1] ?? 0
+        b += rgb[i + 2] ?? 0
+        n++
+      }
+    }
+    if (n === 0) return 0
+    // ponytail: 5 bits per channel keeps distinct colour pairs under the terminal's palette; dither if banding shows
+    const q = (v: number) => Math.round(v / n) & 0xf8
+    return ((q(r) << 16) | (q(g) << 8) | q(b)) >>> 0
+  }
+  let o = 0
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      dv.setUint32(o, 0x2580, true)
+      dv.setUint32(o + 4, sample(col, row * 2), true)
+      dv.setUint32(o + 8, sample(col, row * 2 + 1), true)
+      o += 12
+    }
+  }
+  return toB64(out)
 }
 
 let captureSeq = 0
@@ -158,44 +303,84 @@ function scheduleCapture($: Eng, dir: string, at: number) {
   captureTimer = $.clock.after(500, () => void capture($, dir, at))
 }
 
-async function capture($: Eng, dir: string, at: number) {
-  const seq = ++captureSeq
-  const out = `${dir}/${WORK}`
-  await working($, `capturing frame @ ${fmt(at)}s…`)
+/** Grabs the frame at `at`: Studio's thumbnail API when the server runs (~0.5 s), else `hyperframes snapshot` (~4 s). */
+async function grabFrame($: Eng, dir: string, at: number, out: string): Promise<string | null> {
+  const srv = await read($, studio)
+  const full = `${out}/frame.png`
+  if (srv) {
+    const url = `${srv.serverUrl}/api/projects/${encodeURIComponent(srv.projectName)}/thumbnail/index.html?t=${fmt(at)}&format=png&output=source`
+    const r = await $.process.run(['curl', '-sf', '--max-time', '20', '-o', full, url], { timeoutMs: 25_000 }).catch(() => ({ exitCode: 1 }))
+    if (r.exitCode === 0) return full
+  }
   const r = await run($, dir, ['snapshot', '--at', fmt(at), '--no-end', '--describe', 'false', '-o', out])
-  if (seq !== captureSeq) return // a later seek superseded this one
   const frames = (await $.fs.list(out).catch(() => []))
     .filter(f => /^frame-\d+-at-.*\.png$/.test(f.name))
     .sort((a, b) => b.mtimeMs - a.mtimeMs)
   const frame = frames[0]
   if (!frame) {
-    await working($, '')
-    return say($, `snapshot failed: ${tail(r.stderr || r.stdout)}`)
+    await say($, `snapshot failed: ${tail(r.stderr || r.stdout)}`)
+    return null
   }
-  const full = `${out}/${frame.name}`
+  await $.process.run(['mv', '-f', `${out}/${frame.name}`, full]).catch(() => undefined)
+  return full
+}
+
+async function capture($: Eng, dir: string, at: number) {
+  const seq = ++captureSeq
+  const out = `${dir}/${WORK}`
+  await working($, `frame @ ${fmt(at)}s…`)
+  const full = await grabFrame($, dir, at, out)
+  if (seq !== captureSeq) return // a later seek superseded this one
+  if (!full) return working($, '')
   const png = `${out}/preview.png`
   const jpg = `${out}/preview.jpg`
+  const rgb = `${out}/preview.rgb`
   const ff = await $.process.run(
-    ['ffmpeg', '-y', '-loglevel', 'error', '-i', full, '-vf', 'scale=960:-2', png, '-vf', 'scale=480:-2', '-q:v', '6', jpg],
+    ['ffmpeg', '-y', '-loglevel', 'error', '-i', full,
+      '-vf', 'scale=960:-2', png,
+      '-vf', 'scale=480:-2', '-q:v', '6', jpg,
+      '-vf', `scale=${RGB_W}:-1:flags=area`, '-f', 'rawvideo', '-pix_fmt', 'rgb24', rgb],
     { timeoutMs: 30_000 },
   )
-  await $.process.run(['rm', '-f', ...frames.map(f => `${out}/${f.name}`)]).catch(() => undefined)
   if (ff.exitCode !== 0) {
     await working($, '')
     return say($, `ffmpeg: ${tail(ff.stderr)}`)
   }
-  const { base64 } = await $.fs.read(png, { as: 'bytes' })
-  const { width, height } = pngSize(base64)
-  await update($, preview, () => ({ at, png, jpg, width, height, gen: seq }))
+  await update($, preview, () => ({ at, png, jpg, rgb, rgbW: RGB_W, gen: seq }))
   await working($, '')
 }
 
-let imageCache: { path: string; gen: number; base64: string } | undefined
-async function imageBase64($: Eng, path: string, gen: number) {
-  if (imageCache?.path === path && imageCache.gen === gen) return imageCache.base64
+const fileCache = new Map<string, { gen: number; base64: string }>()
+async function cachedBase64($: Eng, path: string, gen: number) {
+  const hit = fileCache.get(path)
+  if (hit && hit.gen === gen) return hit.base64
   const { base64 } = await $.fs.read(path, { as: 'bytes' })
-  imageCache = { path, gen, base64 }
+  fileCache.set(path, { gen, base64 })
   return base64
+}
+
+// slideshow-style playback: one frame every STEP seconds of timeline, as fast as frames arrive
+let isPlayingNow = false
+function stopPlaying() {
+  isPlayingNow = false
+}
+async function togglePlay($: Eng, dir: string) {
+  if (isPlayingNow) {
+    stopPlaying()
+    return
+  }
+  isPlayingNow = true
+  await update($, playing, () => true)
+  const end = (await read($, timeline))?.duration ?? 0
+  let t = await read($, playhead)
+  if (t >= end - 0.01) t = 0
+  while (isPlayingNow && t < end) {
+    await update($, playhead, () => t)
+    await capture($, dir, t)
+    t = Math.min(end, Math.round((t + STEP) * 1000) / 1000)
+  }
+  isPlayingNow = false
+  await update($, playing, () => false)
 }
 
 // ---------- edits (the CLI's own timeline mutations) ----------
@@ -220,7 +405,7 @@ async function edit($: Eng, dir: string, label: string, args: string[]) {
   const j = json(r.stdout)
   await working($, '')
   if (!j?.ok) {
-    const why = j?.error?.message ?? (typeof j?.error === 'string' ? j.error : '') ?? ''
+    const why = j?.error?.message ?? (typeof j?.error === 'string' ? j.error : '')
     return say($, `${label} failed: ${why || tail(r.stderr || r.stdout)}`)
   }
   if (j.receipt && typeof j.receipt === 'object' && !Array.isArray(j.receipt)) {
@@ -235,7 +420,7 @@ async function edit($: Eng, dir: string, label: string, args: string[]) {
 async function withClip($: Eng, fn: (clip: HfClip, t: number) => Promise<void>) {
   const [tl, sel, t] = await Promise.all([read($, timeline), read($, selected), read($, playhead)])
   const clip = tl?.clips.find(c => c.id === sel)
-  if (!clip) return say($, 'select a clip first (press its row or its number)')
+  if (!clip) return say($, 'select a clip first (click it in Studio, or press its row or number here)')
   await fn(clip, t)
 }
 
@@ -244,7 +429,7 @@ const inside = (clip: HfClip, t: number) => t > clip.absStart && t < clip.absEnd
 async function undoLast($: Eng, dir: string) {
   const list = await read($, receipts)
   const last = list[list.length - 1]
-  if (!last) return say($, 'nothing to undo (only edits made from this pane are undoable here)')
+  if (!last) return say($, 'nothing to undo here (Studio has its own Undo for edits made there)')
   await working($, 'undo…')
   const r = await run($, dir, ['timeline', 'undo', last, '--json'])
   const j = json(r.stdout)
@@ -253,45 +438,6 @@ async function undoLast($: Eng, dir: string) {
   await update($, receipts, l => l.slice(0, -1))
   await say($, 'undo ✓')
   await refresh($, dir)
-}
-
-// ---------- Studio bridge ----------
-
-async function pullStudio($: Eng, dir: string) {
-  const r = await run($, dir, ['preview', '--context', '--json', '--context-fields', 'selection,server'])
-  const j = json(r.stdout)
-  if (!j?.ok) return say($, `Studio: ${j?.error?.message ?? 'not running'} — press Open Studio first`)
-  if (j.server?.url) {
-    const url = `${String(j.server.url).replace('127.0.0.1', 'localhost')}/#project/${j.server.projectName ?? base(dir)}`
-    await update($, studioUrl, () => url)
-  }
-  const s = j.selection
-  if (!s) {
-    await update($, studio, () => null)
-    return say($, `Studio: ${j.errors?.selection?.message ?? 'no selection'} — click an element in Studio, then press again`)
-  }
-  const t = s.target ?? {}
-  const time = typeof s.currentTime === 'number' ? s.currentTime : typeof s.time === 'number' ? s.time : null
-  await update($, studio, () => ({
-    hfId: t.hfId ?? null,
-    selector: t.selector ?? null,
-    file: s.sourceFile ?? s.file ?? t.sourceFile ?? null,
-    text: typeof s.textContent === 'string' ? s.textContent.slice(0, 120) : typeof s.text === 'string' ? s.text.slice(0, 120) : null,
-    time,
-  }))
-  if (time !== null) await seek($, dir, time)
-  await say($, `Studio selection: ${t.hfId ?? t.selector ?? '?'}`)
-}
-
-async function openStudio($: Eng, dir: string) {
-  await working($, 'starting Studio…')
-  const r = await run($, dir, ['preview', '--background', '--no-open'], 90_000)
-  const st = json((await run($, dir, ['preview', '--status', '--json'])).stdout)
-  await working($, '')
-  const url: string | undefined = st?.result?.studioUrl ?? r.stdout.match(/https?:\/\/\S+#project\/\S+/)?.[0]
-  if (!url) return say($, `Studio did not start: ${tail(r.stderr || r.stdout)}`)
-  await update($, studioUrl, () => url.replace('127.0.0.1', 'localhost'))
-  await say($, 'Studio is running — open the link, click an element there, then press Studio sel')
 }
 
 // ---------- check / render ----------
@@ -321,36 +467,49 @@ async function renderDraft($: Eng, dir: string) {
   $.ui.toast(`Cutroom: draft rendered → ${out}`)
 }
 
-// ---------- point-and-ask ----------
+// ---------- what Claude is told ----------
 
 let pendingRefresh = false
 
-async function askClaude($: Eng, dir: string, request: string) {
-  const [t, tl, sel, st, pv] = await Promise.all([
+async function contextBlock($: Eng, dir: string): Promise<string> {
+  const [t, tl, selId, sel, pv, srv] = await Promise.all([
     read($, playhead),
     read($, timeline),
     read($, selected),
-    read($, studio),
+    read($, selection),
     read($, preview),
+    read($, studio),
   ])
-  const clip = tl?.clips.find(c => c.id === sel)
-  const lines: Array<string | null> = [
-    `[Cutroom] project: ${dir}`,
-    `playhead: ${fmt(t)}s${pv ? ` — snapshot of that frame: ${pv.png} (read it to see what is on screen)` : ''}`,
-    clip
-      ? `selected clip: ${clip.id} on the ${clip.trackKind} track, ${fmt(clip.absStart)}–${fmt(clip.absEnd)}s, declared in ${clip.file}${clip.src ? ` (src ${clip.src})` : ''}`
-      : 'selected clip: none',
-    st
-      ? `Studio selection: ${st.hfId ? `data-hf-id ${st.hfId}` : (st.selector ?? '?')}${st.file ? ` in ${st.file}` : ''}${st.text ? ` text "${st.text}"` : ''}`
-      : null,
-    '',
-    `Edit request: ${request}`,
-    '',
-    'Make this edit in the HyperFrames project above. Load the hyperframes skill (and hyperframes-core; hyperframes-keyframes for motion, hyperframes-audio for sound) before touching files; change only what the request names; run `hyperframes lint` in the project afterwards; reply in one or two sentences with what changed.',
+  const clip = tl?.clips.find(c => c.id === selId)
+  const lines: string[] = [
+    `[Cutroom] The person is editing the HyperFrames project at ${dir}${srv ? ` with Studio open at ${srv.studioUrl}` : ''}.`,
   ]
+  if (sel) {
+    lines.push(
+      `Studio selection ("this" / 這個 / 這段 means it): ${sel.label ?? ''} ${sel.selector ?? ''}${sel.hfId ? ` data-hf-id=${sel.hfId}` : ''}${sel.file ? ` in ${sel.file}` : ''}${sel.text ? ` — text "${sel.text}"` : ''}`.replace(/\s+/g, ' '),
+    )
+  }
+  if (clip) {
+    lines.push(
+      `Selected clip: ${clip.id} on the ${clip.trackKind} track, ${fmt(clip.absStart)}–${fmt(clip.absEnd)}s, declared in ${clip.file}${clip.src ? ` (src ${clip.src})` : ''}.`,
+    )
+  } else if (!sel) lines.push('Nothing is selected.')
+  lines.push(`Playhead: ${fmt(t)}s.${pv ? ` A snapshot of that frame is at ${pv.png} (Read it to see the picture).` : ''}`)
+  if (tl) {
+    lines.push(
+      `Timeline (${fmt(tl.duration)}s): ${tl.clips.map(c => `${c.id} [${c.trackKind}] ${fmt(c.absStart)}–${fmt(c.absEnd)}${c.src ? ` ${c.src}` : ''}`).join('; ')}`,
+    )
+  }
+  lines.push(
+    'Before editing composition files load the hyperframes skill (and hyperframes-core; hyperframes-keyframes for motion, hyperframes-audio for sound). Use `hyperframes timeline <verb>` for cuts and `hyperframes snapshot --at <t>` to look at any other frame. Change only what the person named, run `hyperframes lint` afterwards, and keep the reply to one or two sentences. Studio reloads by itself.',
+  )
+  return lines.join('\n')
+}
+
+async function askClaude($: Eng, dir: string, request: string) {
   pendingRefresh = true
   await say($, `sent to Claude: ${request.slice(0, 70)}`)
-  void $.prompt.submit({ text: lines.filter((l): l is string => l !== null).join('\n') })
+  void $.prompt.submit({ text: `${request}\n\n${await contextBlock($, dir)}` })
 }
 
 // ---------- drawing helpers ----------
@@ -369,23 +528,37 @@ function bar(width: number, duration: number, s: number, e: number, t: number) {
 }
 
 const pad = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s.padEnd(n))
-
 const TRACK_ORDER = ['video', 'graphics', 'captions', 'audio']
 
 // ---------- register ----------
 
 export const register: Register = on => {
+  let hasPixels = false // the terminal speaks the kitty graphics protocol
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'cut',
-      description: 'Cutroom: HyperFrames cutting-room pane — frame preview, timeline, trim/split/move, Studio selection, ask Claude to edit',
+      description: 'Cutroom: HyperFrames cutting-room pane — frame preview, Studio sync, trim/split/move, ask Claude to edit',
       argumentHint: '[project-dir]',
     })
+    const [termProgram, kitty, ghostty] = await Promise.all([
+      $.env.get('TERM_PROGRAM'),
+      $.env.get('KITTY_WINDOW_ID'),
+      $.env.get('GHOSTTY_RESOURCES_DIR'),
+    ])
+    hasPixels = Boolean(kitty || ghostty || /kitty|ghostty/i.test(termProgram ?? ''))
     const started = await next(e)
-    if (e.isInteractive && (await $.fs.exists(`${e.cwd}/hyperframes.json`))) {
+    const open = await read($, project)
+    if (open) {
+      // a reload: keep the Studio link and the live selection alive, and redraw the frame
       void (async () => {
-        await $.ui.open({ id: PANE, title: 'Cutroom', columns: 96, rows: 40 })
-        await openProject($, e.cwd)
+        await ensureStudio($, open, false)
+        await refresh($, open)
+      })()
+    } else if (e.isInteractive && (await $.fs.exists(`${e.cwd}/hyperframes.json`))) {
+      void (async () => {
+        await $.ui.open({ id: PANE, title: 'Cutroom', columns: 100, rows: 24 })
+        await openProject($, e.cwd, false)
       })()
     }
     return started
@@ -396,24 +569,27 @@ export const register: Register = on => {
     const home = (await $.env.get('HOME')) ?? ''
     let arg = e.args.trim()
     if (arg.startsWith('~')) arg = home + arg.slice(1)
-    await $.ui.open({ id: PANE, title: 'Cutroom', focus: true, columns: 96, rows: 40 })
+    await $.ui.open({ id: PANE, title: 'Cutroom', focus: true, columns: 100, rows: 24 })
     if (arg) {
       const dir = arg.startsWith('/') ? arg : `${cwd}/${arg}`
-      await openProject($, dir)
+      await openProject($, dir, true)
       return { text: `Cutroom: ${dir}` }
     }
     const current = await read($, project)
-    if (current) return { text: `Cutroom: ${current}` }
+    if (current) {
+      await ensureStudio($, current, true)
+      return { text: `Cutroom: ${current}` }
+    }
     const last = await $.store.get(`last:${cwd}`)
     if (typeof last === 'string' && (await isProject($, last))) {
-      await openProject($, last)
+      await openProject($, last, true)
       return { text: `Cutroom: ${last}` }
     }
     const found = await findProjects($, cwd)
     await update($, candidates, () => found)
     const only = found[0]
     if (found.length === 1 && only) {
-      await openProject($, only)
+      await openProject($, only, true)
       return { text: `Cutroom: ${only}` }
     }
     return {
@@ -421,6 +597,14 @@ export const register: Register = on => {
         ? `Cutroom: ${found.length} projects found — pick one in the pane`
         : 'Cutroom: no project under this directory. Run /cut <project-dir>',
     }
+  })
+
+  // what the person types in the normal prompt carries the Studio selection and the playhead
+  on('prompt.submit', async ($, e, next) => {
+    const dir = await read($, project)
+    if (!dir || e.origin.kind !== 'composer' || !(await read($, autoContext))) return next(e)
+    pendingRefresh = true
+    return next({ ...e, context: [...(e.context ?? []), await contextBlock($, dir)] })
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -431,6 +615,12 @@ export const register: Register = on => {
       void refresh($, dir)
     }
     return done
+  })
+
+  on('ui.close', { id: PANE }, ($, e, next) => {
+    pollTimer?.cancel()
+    stopPlaying()
+    return next(e)
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -444,18 +634,20 @@ export const register: Register = on => {
     }
     const { Box, Text, Button, Input, Link } = $.ui.resolve(e)
     const width = Math.max(48, e.props.bodyColumns - 1)
-    const [dir, tl, sel, t, pv, st, url, msg, job, rc, cands] = await Promise.all([
+    const [dir, tl, selId, t, pv, srv, sel, msg, job, rc, cands, ctxOn, isPlaying] = await Promise.all([
       read($, project),
       read($, timeline),
       read($, selected),
       read($, playhead),
       read($, preview),
       read($, studio),
-      read($, studioUrl),
+      read($, selection),
       read($, status),
       read($, busy),
       read($, receipts),
       read($, candidates),
+      read($, autoContext),
+      read($, playing),
     ])
 
     if (!dir) {
@@ -473,7 +665,7 @@ export const register: Register = on => {
               plain
               {...(i < 9 ? { hotkey: String(i + 1) } : {})}
               label={c}
-              onPress={() => void openProject($, c)}
+              onPress={() => void openProject($, c, true)}
             />
           ))}
           {msg !== '' && <Text dimColor>{msg}</Text>}
@@ -482,24 +674,44 @@ export const register: Register = on => {
     }
 
     const clips = tl?.clips ?? []
-    const clip = clips.find(c => c.id === sel)
+    const clip = clips.find(c => c.id === selId)
     const duration = tl?.duration ?? 0
 
-    // preview
+    // the frame: kitty pixels, half-block cells, or an Svg on the desktop
     let frame: JSX.Element
-    if (!pv) {
+    if (!pv || !pv.rgb) {
       frame = <Text dimColor>{job || 'no frame yet — press ⟳ (r)'}</Text>
     } else if (e.surface === 'terminal') {
-      const { Image } = $.ui.resolve(e)
-      const cols = Math.min(255, width - 2)
-      const rows = Math.min(255, Math.max(4, Math.round((cols * pv.height) / pv.width / 2.1)))
-      const b64 = await imageBase64($, pv.png, pv.gen)
-      frame = <Image key="frame" source={{ png: b64 }} columns={cols} rows={rows} alt={`frame @ ${fmt(pv.at)}s → ${pv.png}`} />
+      const inline = e.props.placement === 'inline'
+      if (hasPixels) {
+        const { Image } = $.ui.resolve(e)
+        const b64 = await cachedBase64($, pv.png, pv.gen)
+        const { width: w, height: h } = pngSize(b64)
+        const maxRows = inline ? 10 : 30
+        const cols = Math.max(8, Math.min(255, width - 2, Math.round((maxRows * 2.1 * w) / h)))
+        const rows = Math.max(2, Math.min(255, Math.round((cols * h) / w / 2.1)))
+        frame = <Image key="frame" source={{ png: b64 }} columns={cols} rows={rows} alt={`frame @ ${fmt(pv.at)}s → ${pv.png}`} />
+      } else {
+        const { Raster } = $.ui.resolve(e)
+        const bytes = fromB64(await cachedBase64($, pv.rgb, pv.gen))
+        const srcW = pv.rgbW
+        const srcH = Math.floor(bytes.length / (srcW * 3))
+        if (srcH < 2) {
+          frame = <Text dimColor>frame @ {fmt(pv.at)}s → {pv.png}</Text>
+        } else {
+          const maxRows = inline ? 10 : 28
+          const cols = Math.max(8, Math.min(width - 2, 512, Math.round((maxRows * 2 * srcW) / srcH)))
+          const rows = Math.max(1, Math.min(256, Math.round((cols * srcH) / srcW / 2)))
+          frame = <Raster key="frame" columns={cols} rows={rows} cells={rasterCells(bytes, srcW, srcH, cols, rows)} />
+        }
+      }
     } else {
       const { Svg } = $.ui.resolve(e)
-      const b64 = await imageBase64($, pv.jpg, pv.gen)
+      const b64 = await cachedBase64($, pv.jpg, pv.gen)
+      const png = await cachedBase64($, pv.png, pv.gen)
+      const { width: w0, height: h0 } = pngSize(png)
       const w = 480
-      const h = Math.max(1, Math.round((w * pv.height) / pv.width))
+      const h = Math.max(1, Math.round((w * h0) / w0))
       frame = (
         <Svg
           source={`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><image href="data:image/jpeg;base64,${b64}" width="${w}" height="${h}"/></svg>`}
@@ -510,7 +722,7 @@ export const register: Register = on => {
       )
     }
 
-    // timeline rows, grouped by track kind
+    // compact clip list, grouped by track kind
     const kinds = [...TRACK_ORDER.filter(k => clips.some(c => c.trackKind === k)), ...clips.map(c => c.trackKind).filter(k => !TRACK_ORDER.includes(k))].filter(
       (k, i, all) => all.indexOf(k) === i,
     )
@@ -523,7 +735,7 @@ export const register: Register = on => {
           .filter(c => c.trackKind === kind)
           .map(c => {
             const i = n++
-            const isSel = c.id === sel
+            const isSel = c.id === selId
             return (
               <Box>
                 <Text bold={isSel}>{isSel ? '▸' : ' '}</Text>
@@ -556,17 +768,25 @@ export const register: Register = on => {
         await edit($, dir, label, a)
       })
 
+    const where = sel
+      ? `Studio: ${sel.label ?? sel.id ?? sel.selector ?? '?'}${sel.file ? ` · ${sel.file}` : ''}${clip && clip.id !== sel.id ? ` · in clip ${clip.id}` : ''}`
+      : clip
+        ? `clip ${clip.id} · ${fmt(clip.absStart)}–${fmt(clip.absEnd)}s · ${clip.file}${clip.src ? ` · ${clip.src}` : ''}`
+        : 'nothing selected — click something in Studio, or a row below'
+
     return (
       <Box flexDirection="column">
-        <Box>
+        <Box gap={1}>
           <Text bold>{base(dir)}</Text>
           <Text dimColor>
-            {' '}
-            · {fmt(duration)}s · {clips.length} clips · playhead {fmt(t)}s
+            · {fmt(duration)}s · Studio {srv ? '●' : '○'}
           </Text>
+          <Button key="studio-open" plain hotkey="g" label={srv ? '[open Studio ↗]' : '[start Studio]'} onPress={() => void ensureStudio($, dir, true)} />
+          {srv !== null && <Link href={srv.studioUrl} label={srv.studioUrl.replace(/^https?:\/\//, '')} />}
         </Box>
         {frame}
         <Box gap={1}>
+          <Button key="play" plain hotkey="p" label={isPlaying ? '■' : '▶'} onPress={() => void togglePlay($, dir)} />
           <Button key="seek-start" plain hotkey="a" label="|◀" onPress={go(clip ? clip.absStart : 0)} />
           <Button key="seek-m1" plain hotkey="j" label="-1s" onPress={go(t - 1)} />
           <Button key="seek-m01" plain hotkey="h" label="-.1" onPress={go(t - 0.1)} />
@@ -585,13 +805,7 @@ export const register: Register = on => {
             }}
           />
         </Box>
-        <Box flexDirection="column">{rows}</Box>
-        <Box>
-          <Text dimColor>
-            {clip ? `selected ${clip.id} · ${clip.file}${clip.src ? ` · ${clip.src}` : ''}${clip.children ? ` · ${clip.children} nested` : ''}` : 'no clip selected'}
-            {st ? ` · Studio: ${st.hfId ?? st.selector ?? '?'}` : ''}
-          </Text>
-        </Box>
+        <Text dimColor>{where}</Text>
         <Box gap={1} flexWrap="wrap">
           <Button
             key="trim-in"
@@ -615,25 +829,29 @@ export const register: Register = on => {
           <Button key="dup" hotkey="d" label="Duplicate" onPress={op('duplicate', c => ['duplicate', c.ref])} />
           <Button key="delete" hotkey="x" label="Delete" onPress={op('delete', c => ['delete', c.ref])} />
           <Button key="undo" hotkey="u" label={`Undo (${rc.length})`} onPress={() => void undoLast($, dir)} />
-        </Box>
-        <Box gap={1} flexWrap="wrap">
-          <Button key="studio-open" hotkey="g" label="Open Studio" onPress={() => void openStudio($, dir)} />
-          <Button key="studio-sel" hotkey="e" label="Studio sel" onPress={() => void pullStudio($, dir)} />
           <Button key="check" hotkey="c" label="Check" onPress={() => void check($, dir)} />
           <Button key="render" hotkey="v" label="Render draft" onPress={() => void renderDraft($, dir)} />
-          <Button key="reload" hotkey="p" label="Reload" onPress={() => void refresh($, dir)} />
-          {url !== null && <Link href={url} label="Studio ↗" />}
+          <Button key="reload" hotkey="z" label="Reload" onPress={() => void refresh($, dir)} />
+          <Button
+            key="ctx"
+            plain
+            hotkey="t"
+            dimColor={!ctxOn}
+            label={`prompt context: ${ctxOn ? 'on' : 'off'}`}
+            onPress={() => void update($, autoContext, v => !v)}
+          />
         </Box>
         <Input
           key="ask"
           label="Ask Claude ›"
-          placeholder="change what? e.g. 把這段標題放大、進場再慢一點"
+          placeholder="change what? e.g. 把這段標題放大、進場再慢一點 (or just type in the main prompt)"
           submitLabel="send"
           onSubmit={v => {
             if (v.trim()) void askClaude($, dir, v.trim())
           }}
         />
         <Text dimColor>{job || msg}</Text>
+        <Box flexDirection="column">{rows}</Box>
       </Box>
     )
   })
