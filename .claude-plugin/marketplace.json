@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-mod-cutroom",
+  "description": "Cutroom: a cutting-room pane for HyperFrames projects inside Claude Code.",
+  "owner": {
+    "name": "leepokai",
+    "url": "https://github.com/leepokai"
+  },
+  "plugins": [
+    {
+      "name": "cutroom",
+      "description": "Cutroom: a cutting-room pane for HyperFrames projects inside Claude Code \u2014 frame preview, timeline, trim/split/move/delete/undo, Studio selection bridge, and point-and-ask edits sent to Claude.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

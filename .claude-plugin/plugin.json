@@ -1,0 +1,22 @@
+{
+  "name": "cutroom",
+  "version": "0.1.0",
+  "description": "Cutroom: a cutting-room pane for HyperFrames projects inside Claude Code \u2014 frame preview, timeline, trim/split/move/delete/undo, Studio selection bridge, and point-and-ask edits sent to Claude.",
+  "author": {
+    "name": "leepokai",
+    "url": "https://github.com/leepokai"
+  },
+  "homepage": "https://github.com/leepokai/claude-mod-cutroom",
+  "repository": "https://github.com/leepokai/claude-mod-cutroom",
+  "license": "MIT",
+  "keywords": [
+    "claude-mod",
+    "hyperframes",
+    "video",
+    "editor",
+    "cutroom",
+    "timeline",
+    "pane"
+  ],
+  "types": "./types/index.d.ts"
+}
