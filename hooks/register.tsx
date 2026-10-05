@@ -6,9 +6,10 @@ import type { HfClip, HfPreview, HfSelection, HfStudio, HfTimeline } from '../ty
 // Cutroom: a cutting-room pane for HyperFrames projects.
 //
 // The picture lives in three places at once: HyperFrames Studio in the browser
-// (full fidelity, real playback), a frame thumbnail in this pane (kitty pixels
-// where the terminal has them, half-block cells everywhere else, an Svg on the
-// desktop app), and a snapshot path Claude can read. Studio's selection and
+// (full fidelity), a *live player* in this pane (player/cutroom-player.mjs plays
+// the composition in headless Chrome and streams its frames: an Svg on the
+// desktop app, kitty pixels or half-block cells in a terminal), and a snapshot
+// path Claude can read. Studio's selection and
 // time are polled into the pane and attached to every prompt the person types,
 // so "make this bigger" needs no further pointing. Cuts are the HyperFrames
 // CLI's own `timeline` verbs; everything else goes to Claude.
@@ -16,7 +17,8 @@ import type { HfClip, HfPreview, HfSelection, HfStudio, HfTimeline } from '../ty
 const PANE = 'cutroom'
 const WORK = '.hyperframes/cutroom'
 const RGB_W = 192 // width of the raw strip the terminal thumbnail is built from
-const STEP = 0.5 // seconds between frames while "playing"
+const LIVE_W = 854 // the live player's viewport
+const LIVE_H = 480
 
 const project = atom({ plugin: 'cutroom', key: 'project' } as const, null as string | null)
 const candidates = atom({ plugin: 'cutroom', key: 'candidates' } as const, [] as string[])
@@ -30,7 +32,7 @@ const status = atom({ plugin: 'cutroom', key: 'status' } as const, '')
 const busy = atom({ plugin: 'cutroom', key: 'busy' } as const, '')
 const receipts = atom({ plugin: 'cutroom', key: 'receipts' } as const, [] as string[])
 const autoContext = atom({ plugin: 'cutroom', key: 'autoContext' } as const, true)
-const playing = atom({ plugin: 'cutroom', key: 'playing' } as const, false)
+const live = atom({ plugin: 'cutroom', key: 'live' } as const, null as { port: number; duration: number } | null)
 
 type Eng = EngineInterface
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -41,6 +43,8 @@ const base = (p: string) => p.replace(/\/+$/, '').split('/').pop() || p
 const tail = (s: string, n = 200) => s.trim().slice(-n)
 const say = ($: Eng, text: string) => update($, status, () => text)
 const working = ($: Eng, text: string) => update($, busy, () => text)
+// background work outlives a hot reload or a test; its late writes are refused and dropped
+const quiet = () => undefined
 
 // ---------- HyperFrames CLI ----------
 
@@ -108,7 +112,8 @@ async function findProjects($: Eng, cwd: string): Promise<string[]> {
 async function openProject($: Eng, dir: string, openBrowser: boolean) {
   const clean = dir.replace(/\/+$/, '')
   if (!(await isProject($, clean))) return say($, `not a HyperFrames project: ${clean}`)
-  stopPlaying()
+  stopLive()
+  await update($, live, () => null)
   await update($, project, () => clean)
   await update($, selected, () => null)
   await update($, preview, () => null)
@@ -120,7 +125,8 @@ async function openProject($: Eng, dir: string, openBrowser: boolean) {
   await say($, `opened ${base(clean)}`)
   await loadTimeline($, clean)
   await ensureStudio($, clean, openBrowser)
-  void capture($, clean, 0)
+  void capture($, clean, 0).catch(quiet) // a poster frame while the live player starts
+  void startLive($, clean).catch(quiet)
 }
 
 // ---------- timeline ----------
@@ -150,7 +156,7 @@ async function loadTimeline($: Eng, dir: string) {
 
 async function refresh($: Eng, dir: string) {
   await loadTimeline($, dir)
-  void capture($, dir, await read($, playhead))
+  if (!(await liveCmd($, { op: 'reload' }))) void capture($, dir, await read($, playhead)).catch(quiet)
 }
 
 // ---------- Studio: server, browser, live selection ----------
@@ -192,7 +198,7 @@ function startPolling($: Eng, dir: string) {
   pollTimer?.cancel()
   pollFailures = 0
   lastSelectionAt = undefined
-  pollTimer = $.clock.every(1500, () => void pollSelection($, dir))
+  pollTimer = $.clock.every(1500, () => void pollSelection($, dir).catch(quiet))
 }
 
 async function pollSelection($: Eng, dir: string) {
@@ -300,7 +306,7 @@ let captureTimer: { cancel: () => void } | undefined
 
 function scheduleCapture($: Eng, dir: string, at: number) {
   captureTimer?.cancel()
-  captureTimer = $.clock.after(500, () => void capture($, dir, at))
+  captureTimer = $.clock.after(500, () => void capture($, dir, at).catch(quiet))
 }
 
 /** Grabs the frame at `at`: Studio's thumbnail API when the server runs (~0.5 s), else `hyperframes snapshot` (~4 s). */
@@ -359,28 +365,113 @@ async function cachedBase64($: Eng, path: string, gen: number) {
   return base64
 }
 
-// slideshow-style playback: one frame every STEP seconds of timeline, as fast as frames arrive
-let isPlayingNow = false
-function stopPlaying() {
-  isPlayingNow = false
+// ---------- live player ----------
+
+type LiveFrame = { seq: number; jpeg: string; rgb: string | null; rgbW: number; rgbH: number }
+let liveStream: AsyncGenerator<unknown, unknown> | undefined
+let livePort = 0
+let liveSeq = -1
+let liveFrame: LiveFrame | null = null
+let liveT = 0
+let livePaused = true
+let liveTimer: { cancel: () => void } | undefined
+let liveInflight = false
+let rgbWant = 0 // the terminal draws from raw rgb this wide; 0 = jpeg only (desktop)
+
+function stopLive() {
+  liveTimer?.cancel()
+  liveTimer = undefined
+  const stream = liveStream
+  liveStream = undefined
+  void stream?.return(undefined) // leaving the loop kills the helper, which kills Chrome and the play server
+  livePort = 0
+  liveSeq = -1
+  liveFrame = null
+  livePaused = true
 }
-async function togglePlay($: Eng, dir: string) {
-  if (isPlayingNow) {
-    stopPlaying()
-    return
+
+async function startLive($: Eng, dir: string) {
+  stopLive()
+  const config = { project: dir, hf: await hf($), width: LIVE_W, height: LIVE_H }
+  const stream = $.process.spawn({ argv: ['node', `${$.plugin.root}/player/cutroom-player.mjs`, JSON.stringify(config)], cwd: dir })
+  liveStream = stream
+  await working($, 'starting the live player…')
+  let head = ''
+  try {
+    for await (const { stream: pipe, text } of stream) {
+      if (pipe === 'stderr') {
+        $.ui.log(text.trim().slice(0, 300), { to: 'debug' })
+        continue
+      }
+      if (livePort) continue
+      head += text
+      const nl = head.indexOf('\n')
+      if (nl < 0) continue
+      const first = json(head.slice(0, nl))
+      await working($, '')
+      if (!first?.port) {
+        await say($, `live player failed: ${first?.error ?? head.slice(0, 200)} — frames fall back to stills`)
+        continue
+      }
+      livePort = Number(first.port)
+      await update($, live, () => ({ port: livePort, duration: Number(first.duration ?? 0) }))
+      await liveCmd($, { op: 'seek', t: await read($, playhead) })
+      liveTimer = $.clock.every(100, () => void pollLive($).catch(quiet))
+    }
+  } catch (err) {
+    if (liveStream === stream) await say($, `live player stopped: ${String(err).slice(0, 200)}`)
   }
-  isPlayingNow = true
-  await update($, playing, () => true)
-  const end = (await read($, timeline))?.duration ?? 0
-  let t = await read($, playhead)
-  if (t >= end - 0.01) t = 0
-  while (isPlayingNow && t < end) {
-    await update($, playhead, () => t)
-    await capture($, dir, t)
-    t = Math.min(end, Math.round((t + STEP) * 1000) / 1000)
+  if (liveStream === stream) {
+    stopLive()
+    await update($, live, () => null)
+    await working($, '')
   }
-  isPlayingNow = false
-  await update($, playing, () => false)
+}
+
+async function liveCmd($: Eng, cmd: { op: string; t?: number; path?: string }): Promise<boolean> {
+  if (!livePort) return false
+  const r = await $.http
+    .fetch(`http://127.0.0.1:${livePort}/cmd`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(cmd) })
+    .catch(() => null)
+  return Boolean(r?.ok)
+}
+
+async function pollLive($: Eng) {
+  if (!livePort || liveInflight) return
+  liveInflight = true
+  try {
+    const r = await $.http.fetch(`http://127.0.0.1:${livePort}/frame?since=${liveSeq}${rgbWant ? `&rgb=${rgbWant}` : ''}`).catch(() => null)
+    const j = r?.ok ? json(r.text) : null
+    if (!j) return
+    const wasPaused = livePaused
+    const t = Math.round(Number(j.t ?? 0) * 1000) / 1000
+    const moved = t !== liveT
+    livePaused = Boolean(j.paused)
+    liveT = t
+    if (typeof j.jpeg === 'string') {
+      liveSeq = Number(j.seq)
+      liveFrame = { seq: liveSeq, jpeg: j.jpeg, rgb: typeof j.rgb === 'string' ? j.rgb : null, rgbW: Number(j.rgbW ?? 0), rgbH: Number(j.rgbH ?? 0) }
+      $.ui.invalidate('ui.render')
+    } else if (moved || wasPaused !== livePaused) $.ui.invalidate('ui.render')
+    if (livePaused && (moved || !wasPaused)) await update($, playhead, () => t)
+  } finally {
+    liveInflight = false
+  }
+}
+
+async function togglePlay($: Eng) {
+  if (!(await liveCmd($, { op: 'toggle' }))) await say($, 'the live player is not running — /cut starts it')
+}
+
+function rgbToRgba(rgb: Uint8Array): string {
+  const out = new Uint8Array((rgb.length / 3) * 4)
+  for (let i = 0, o = 0; i < rgb.length; i += 3) {
+    out[o++] = rgb[i] ?? 0
+    out[o++] = rgb[i + 1] ?? 0
+    out[o++] = rgb[i + 2] ?? 0
+    out[o++] = 255
+  }
+  return toB64(out)
 }
 
 // ---------- edits (the CLI's own timeline mutations) ----------
@@ -390,7 +481,7 @@ async function seek($: Eng, dir: string, to: number) {
   const max = tl?.duration ?? Number.POSITIVE_INFINITY
   const at = Math.max(0, Math.min(max, Math.round(to * 1000) / 1000))
   await update($, playhead, () => at)
-  scheduleCapture($, dir, at)
+  if (!(await liveCmd($, { op: 'seek', t: at }))) scheduleCapture($, dir, at)
 }
 
 async function selectClip($: Eng, dir: string, clip: HfClip) {
@@ -494,7 +585,9 @@ async function contextBlock($: Eng, dir: string): Promise<string> {
       `Selected clip: ${clip.id} on the ${clip.trackKind} track, ${fmt(clip.absStart)}–${fmt(clip.absEnd)}s, declared in ${clip.file}${clip.src ? ` (src ${clip.src})` : ''}.`,
     )
   } else if (!sel) lines.push('Nothing is selected.')
-  lines.push(`Playhead: ${fmt(t)}s.${pv ? ` A snapshot of that frame is at ${pv.png} (Read it to see the picture).` : ''}`)
+  const still = `${dir}/${WORK}/live.jpg`
+  const shot = (await liveCmd($, { op: 'save', path: still })) ? still : pv?.png
+  lines.push(`Playhead: ${fmt(livePort && !livePaused ? liveT : t)}s.${shot ? ` A snapshot of that frame is at ${shot} (Read it to see the picture).` : ''}`)
   if (tl) {
     lines.push(
       `Timeline (${fmt(tl.duration)}s): ${tl.clips.map(c => `${c.id} [${c.trackKind}] ${fmt(c.absStart)}–${fmt(c.absEnd)}${c.src ? ` ${c.src}` : ''}`).join('; ')}`,
@@ -554,12 +647,13 @@ export const register: Register = on => {
       void (async () => {
         await ensureStudio($, open, false)
         await refresh($, open)
-      })()
+        await startLive($, open)
+      })().catch(quiet)
     } else if (e.isInteractive && (await $.fs.exists(`${e.cwd}/hyperframes.json`))) {
       void (async () => {
         await $.ui.open({ id: PANE, title: 'Cutroom', columns: 100, rows: 24 })
         await openProject($, e.cwd, false)
-      })()
+      })().catch(quiet)
     }
     return started
   })
@@ -612,14 +706,15 @@ export const register: Register = on => {
     const dir = await read($, project)
     if (pendingRefresh && dir) {
       pendingRefresh = false
-      void refresh($, dir)
+      void refresh($, dir).catch(quiet)
     }
     return done
   })
 
-  on('ui.close', { id: PANE }, ($, e, next) => {
+  on('ui.close', { id: PANE }, async ($, e, next) => {
     pollTimer?.cancel()
-    stopPlaying()
+    stopLive()
+    await update($, live, () => null)
     return next(e)
   })
 
@@ -634,7 +729,7 @@ export const register: Register = on => {
     }
     const { Box, Text, Button, Input, Link } = $.ui.resolve(e)
     const width = Math.max(48, e.props.bodyColumns - 1)
-    const [dir, tl, selId, t, pv, srv, sel, msg, job, rc, cands, ctxOn, isPlaying] = await Promise.all([
+    const [dir, tl, selId, t0, pv, srv, sel, msg, job, rc, cands, ctxOn, lv] = await Promise.all([
       read($, project),
       read($, timeline),
       read($, selected),
@@ -647,7 +742,7 @@ export const register: Register = on => {
       read($, receipts),
       read($, candidates),
       read($, autoContext),
-      read($, playing),
+      read($, live),
     ])
 
     if (!dir) {
@@ -676,20 +771,56 @@ export const register: Register = on => {
     const clips = tl?.clips ?? []
     const clip = clips.find(c => c.id === selId)
     const duration = tl?.duration ?? 0
+    const isLive = lv !== null && livePort !== 0
+    const isPlaying = isLive && !livePaused
+    const t = isPlaying ? liveT : t0
 
-    // the frame: kitty pixels, half-block cells, or an Svg on the desktop
+    // the frame: the live player's latest (Svg on the desktop, kitty pixels or half-block
+    // cells in a terminal), else the last still
     let frame: JSX.Element
-    if (!pv || !pv.rgb) {
+    const inlinePane = e.surface === 'terminal' && e.props.placement === 'inline'
+    const liveCols = Math.max(8, Math.min(width - 2, 255, Math.round(((inlinePane ? 10 : 28) * 2 * LIVE_W) / LIVE_H)))
+    const liveRows = Math.max(1, Math.round((liveCols * LIVE_H) / LIVE_W / 2))
+    if (isLive && e.surface === 'terminal') {
+      const want = hasPixels ? 480 : Math.min(512, liveCols * 2)
+      if (rgbWant !== want || !liveFrame?.rgb) {
+        rgbWant = want
+        liveSeq = -1 // the next poll fetches the current frame again, with rgb at this width
+      }
+    }
+    if (isLive && liveFrame && e.surface !== 'terminal') {
+      const { Svg } = $.ui.resolve(e)
+      const svgW = Math.max(240, Math.min(LIVE_W, Math.round(e.props.bodyColumns * 7.2)))
+      const svgH = Math.round((svgW * LIVE_H) / LIVE_W)
+      frame = (
+        <Svg
+          source={`<svg xmlns="http://www.w3.org/2000/svg" width="${svgW}" height="${svgH}" viewBox="0 0 ${svgW} ${svgH}"><image href="data:image/jpeg;base64,${liveFrame.jpeg}" width="${svgW}" height="${svgH}"/></svg>`}
+          alt={`live @ ${fmt(t)}s`}
+          width={svgW}
+          height={svgH}
+        />
+      )
+    } else if (isLive && e.surface === 'terminal' && liveFrame?.rgb && liveFrame.rgbH > 1) {
+      // ponytail: a redraw per frame (≤30/s); $.ui.blit on the keyed Raster/Image if the pane ever stutters
+      const bytes = fromB64(liveFrame.rgb)
+      if (hasPixels) {
+        const { Image } = $.ui.resolve(e)
+        frame = <Image key="frame" source={{ rgba: rgbToRgba(bytes), width: liveFrame.rgbW, height: liveFrame.rgbH }} columns={liveCols} rows={liveRows} alt={`live @ ${fmt(t)}s`} />
+      } else {
+        const { Raster } = $.ui.resolve(e)
+        frame = <Raster key="frame" columns={liveCols} rows={liveRows} cells={rasterCells(bytes, liveFrame.rgbW, liveFrame.rgbH, liveCols, liveRows)} />
+      }
+    } else if (!pv || !pv.rgb) {
       frame = <Text dimColor>{job || 'no frame yet — press ⟳ (r)'}</Text>
     } else if (e.surface === 'terminal') {
       const inline = e.props.placement === 'inline'
       if (hasPixels) {
         const { Image } = $.ui.resolve(e)
         const b64 = await cachedBase64($, pv.png, pv.gen)
-        const { width: w, height: h } = pngSize(b64)
+        const { width: imgW, height: imgH } = pngSize(b64)
         const maxRows = inline ? 10 : 30
-        const cols = Math.max(8, Math.min(255, width - 2, Math.round((maxRows * 2.1 * w) / h)))
-        const rows = Math.max(2, Math.min(255, Math.round((cols * h) / w / 2.1)))
+        const cols = Math.max(8, Math.min(255, width - 2, Math.round((maxRows * 2.1 * imgW) / imgH)))
+        const rows = Math.max(2, Math.min(255, Math.round((cols * imgH) / imgW / 2.1)))
         frame = <Image key="frame" source={{ png: b64 }} columns={cols} rows={rows} alt={`frame @ ${fmt(pv.at)}s → ${pv.png}`} />
       } else {
         const { Raster } = $.ui.resolve(e)
@@ -710,14 +841,14 @@ export const register: Register = on => {
       const b64 = await cachedBase64($, pv.jpg, pv.gen)
       const png = await cachedBase64($, pv.png, pv.gen)
       const { width: w0, height: h0 } = pngSize(png)
-      const w = 480
-      const h = Math.max(1, Math.round((w * h0) / w0))
+      const svgW = 480
+      const svgH = Math.max(1, Math.round((svgW * h0) / w0))
       frame = (
         <Svg
-          source={`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><image href="data:image/jpeg;base64,${b64}" width="${w}" height="${h}"/></svg>`}
+          source={`<svg xmlns="http://www.w3.org/2000/svg" width="${svgW}" height="${svgH}" viewBox="0 0 ${svgW} ${svgH}"><image href="data:image/jpeg;base64,${b64}" width="${svgW}" height="${svgH}"/></svg>`}
           alt={`frame @ ${fmt(pv.at)}s`}
-          width={w}
-          height={h}
+          width={svgW}
+          height={svgH}
         />
       )
     }
@@ -779,14 +910,14 @@ export const register: Register = on => {
         <Box gap={1}>
           <Text bold>{base(dir)}</Text>
           <Text dimColor>
-            · {fmt(duration)}s · Studio {srv ? '●' : '○'}
+            · {fmt(duration)}s · {isLive ? 'live ●' : 'stills'} · Studio {srv ? '●' : '○'}
           </Text>
           <Button key="studio-open" plain hotkey="g" label={srv ? '[open Studio ↗]' : '[start Studio]'} onPress={() => void ensureStudio($, dir, true)} />
           {srv !== null && <Link href={srv.studioUrl} label={srv.studioUrl.replace(/^https?:\/\//, '')} />}
         </Box>
         {frame}
         <Box gap={1}>
-          <Button key="play" plain hotkey="p" label={isPlaying ? '■' : '▶'} onPress={() => void togglePlay($, dir)} />
+          <Button key="play" plain hotkey="p" label={isPlaying ? '❚❚' : '▶'} onPress={() => void togglePlay($)} />
           <Button key="seek-start" plain hotkey="a" label="|◀" onPress={go(clip ? clip.absStart : 0)} />
           <Button key="seek-m1" plain hotkey="j" label="-1s" onPress={go(t - 1)} />
           <Button key="seek-m01" plain hotkey="h" label="-.1" onPress={go(t - 0.1)} />

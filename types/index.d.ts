@@ -40,7 +40,7 @@ declare module 'claude-code' {
       busy: string
       receipts: string[]
       autoContext: boolean
-      playing: boolean
+      live: { port: number; duration: number } | null
     }
   }
 }

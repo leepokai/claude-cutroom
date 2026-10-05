@@ -73,7 +73,10 @@ const PANE = {
   viewport: { columns: 160, rows: 50, isFullscreen: true },
 }
 
-function world(on: On, options: { studio: boolean }) {
+const LIVE_JPEG = '/9j/4AAQSkZJRgABAQ' // any string: the desktop draws it inside an Svg
+const LIVE_RGB = (w: number, h: number) => btoa(String.fromCharCode(...new Uint8Array(w * h * 3).fill(128)))
+
+function world(on: On, options: { studio: boolean; live?: boolean }) {
   const ran: string[][] = []
   mock.env(on, { HOME: '/home' })
   mock.store(on)
@@ -93,7 +96,41 @@ function world(on: On, options: { studio: boolean }) {
   on('session.cwd', () => ({ value: PROJ }))
   on('ui.open', () => ({ value: { isPlaced: true as const } }))
   on('command.register', (_, e) => ({ value: { command: e.name } }))
-  on('http.fetch', () => ({ value: { ok: true, status: 200, headers: {}, text: JSON.stringify(STUDIO_SELECTION) } }))
+  const cmds: Array<{ op: string; t?: number }> = []
+  const player = { t: 0, paused: true, seq: 1 }
+  on('http.fetch', (_, e) => {
+    const url = new URL(e.url)
+    const reply = (body: unknown) => ({ value: { ok: true, status: 200, headers: {}, text: JSON.stringify(body) } })
+    if (url.port !== '7777') return reply(STUDIO_SELECTION)
+    if (url.pathname === '/cmd') {
+      const c = JSON.parse(e.init?.body ?? '{}')
+      cmds.push(c)
+      if (c.op === 'toggle') player.paused = !player.paused
+      if (c.op === 'seek') player.t = c.t
+      player.seq++
+      return reply({ ok: true, state: { t: player.t, d: 10, paused: player.paused } })
+    }
+    const since = Number(url.searchParams.get('since'))
+    const rgbW = Number(url.searchParams.get('rgb') ?? 0)
+    const rgbH = Math.round((rgbW * 480) / 854)
+    return reply({
+      seq: player.seq,
+      t: player.t,
+      d: 10,
+      paused: player.paused,
+      ...(player.seq > since ? { jpeg: LIVE_JPEG, ...(rgbW ? { rgb: LIVE_RGB(rgbW, rgbH), rgbW, rgbH } : {}) } : {}),
+    })
+  })
+  on('process.spawn', async function* (_, e, next) {
+    ran.push([...e.argv])
+    if (!options.live) {
+      yield { stream: 'stdout' as const, text: '{"error":"no chrome in tests"}\n' }
+      return { value: { code: 1, signal: null } }
+    }
+    yield { stream: 'stdout' as const, text: '{"port":7777,"duration":10}\n' }
+    await new Promise<void>(resolve => next.signal.addEventListener('abort', () => resolve()))
+    return { value: { code: null, signal: 'SIGTERM' } }
+  })
   on('process.run', (_, e) => {
     ran.push([...e.argv])
     const sub = e.argv[0] === 'node' ? e.argv.slice(2) : e.argv
@@ -103,7 +140,7 @@ function world(on: On, options: { studio: boolean }) {
     else if (sub[0] === 'preview' && sub[1] === '--status') stdout = options.studio ? JSON.stringify(STUDIO_STATUS) : JSON.stringify({ ok: true, result: { state: 'stopped' } })
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
-  return { ran, clock }
+  return { ran, clock, cmds, player }
 }
 
 const COMPOSER = { origin: { kind: 'composer' as const }, presentation: { isFullscreen: true, columns: 160 } }
@@ -173,4 +210,34 @@ test('with Studio: the selection poll lands in the pane and rides the next typed
   await $.prompt.submit({ text: 'unrelated question', wait: false, origin: { kind: 'composer' } })
   expect(entered[1] === undefined || entered[1].length === 0).toBe(true)
   await ui.unmount()
+})
+
+test('live player: the helper starts, frames stream into the pane on every surface, play and seek go to it', async ($, on) => {
+  const { ran, clock, cmds, player } = world(on, { studio: false, live: true })
+  await $.command.run({ command: 'cut', args: PROJ, ...COMPOSER })
+  await clock.advance(50) // the helper is spawned once the timeline and Studio checks are done
+  const helper = ran.find(a => String(a[1]).endsWith('/player/cutroom-player.mjs'))
+  expect(helper?.[0]).toBe('node')
+  expect(JSON.parse(String(helper?.[2])).project).toBe(PROJ)
+
+  await clock.advance(250) // a couple of 100 ms polls
+  const desk = await $.ui.mount({ plugin: 'cutroom', surface: 'desktop', ...PANE })
+  const svg = await desk.find({ type: 'Svg' })
+  expect(String(svg?.props.source)).toContain(`data:image/jpeg;base64,${LIVE_JPEG}`)
+  expect(await desk.find({ text: /live ●/ })).toBeDefined()
+
+  await desk.press({ key: 'play' })
+  expect(cmds.some(c => c.op === 'toggle')).toBe(true)
+  await clock.advance(150)
+  expect(await desk.find({ key: 'play', text: '❚❚' })).toBeDefined()
+  await desk.press({ key: 'play' })
+  await desk.unmount()
+
+  const term = await $.ui.mount({ plugin: 'cutroom', surface: 'terminal', ...PANE })
+  await clock.advance(250) // the terminal asks for rgb, the next poll brings it and redraws
+  expect(await term.find({ type: 'Raster' })).toBeDefined()
+  await term.input({ key: 'goto', text: '3' })
+  expect(cmds.some(c => c.op === 'seek' && c.t === 3)).toBe(true)
+  expect(player.t).toBe(3)
+  await term.unmount()
 })
