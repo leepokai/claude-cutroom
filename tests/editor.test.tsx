@@ -155,8 +155,8 @@ test('timeline: one track of segments; press selects, drag scrubs, cut tools rea
   const tlNode = await desk.find({ key: 'timeline' })
   const segs = (tlNode?.props.props as { segments: Array<{ id: string; label: string; start: number; end: number }> }).segments
   expect(segs).toEqual([
-    { id: 'intro', label: 'Intro', start: 0, end: 4 },
-    { id: 'outro', label: 'Outro', start: 4, end: 10 },
+    { id: 'intro', label: 'Intro', start: 0, end: 4, clipStart: 0, clipEnd: 4 },
+    { id: 'outro', label: 'Outro', start: 4, end: 10, clipStart: 4, clipEnd: 10 },
   ])
   const track = (await desk.findAll({ type: 'Svg' })).map(n => String(n.props.source)).find(src => src.includes('>Outro<'))
   expect(track?.includes('>Intro<')).toBe(true)
@@ -165,14 +165,16 @@ test('timeline: one track of segments; press selects, drag scrubs, cut tools rea
   const ui = await $.ui.mount({ plugin: 'cutroom', surface: 'terminal', ...PANE })
   await ui.resize({ columns: 80, rows: 3, in: 'timeline' })
 
-  // press inside outro: the playhead moves there and the segment is selected
+  // click inside outro: the playhead moves there and the segment is selected
   await ui.pointer({ type: 'down', x: X(5), y: 1, button: 'left', in: 'timeline' })
+  await ui.pointer({ type: 'up', x: X(5), y: 1, button: 'left', in: 'timeline' })
   expect(await ui.find({ text: /00:05\.0/ })).toBeDefined()
   expect(await ui.find({ text: /Outro, 4-10s selected/ })).toBeDefined()
-  // drag scrubs
-  await ui.pointer({ type: 'move', x: X(7), y: 1, button: 'left', in: 'timeline' })
+
+  // the ruler scrubs
+  await ui.pointer({ type: 'down', x: X(7), y: 0, button: 'left', in: 'timeline' })
+  await ui.pointer({ type: 'up', x: X(7), y: 0, button: 'left', in: 'timeline' })
   expect(await ui.find({ text: /00:07\.0/ })).toBeDefined()
-  await ui.pointer({ type: 'up', x: X(7), y: 1, button: 'left', in: 'timeline' })
 
   // the cut tools act on the selected segment's clip at the playhead (now 7s), undoably
   await ui.press({ key: 'split' })
@@ -181,6 +183,24 @@ test('timeline: one track of segments; press selects, drag scrubs, cut tools rea
   expect(await ui.find({ key: 'undo', text: /Undo \(1\)/ })).toBeDefined()
   await ui.press({ key: 'trim-out' })
   expect(ran.find(a => a.includes('trim'))?.slice(2)).toEqual(['timeline', 'trim', '#outro', '--end', '7', '--json'])
+
+  // grab the playhead line on the track (at 7s) and drag it: a scrub, not a clip move
+  await ui.pointer({ type: 'down', x: X(7), y: 1, button: 'left', in: 'timeline' })
+  await ui.pointer({ type: 'move', x: X(8), y: 1, button: 'left', in: 'timeline' })
+  await ui.pointer({ type: 'up', x: X(8), y: 1, button: 'left', in: 'timeline' })
+  expect(await ui.find({ text: /00:08\.0/ })).toBeDefined()
+  expect(ran.some(a => a.includes('move'))).toBe(false)
+
+  // drag the middle of outro 1s earlier: the preview follows its new start, the release moves the clip
+  await ui.pointer({ type: 'down', x: X(6), y: 1, button: 'left', in: 'timeline' })
+  await ui.pointer({ type: 'move', x: X(5), y: 1, button: 'left', in: 'timeline' })
+  expect(await ui.find({ text: /00:03\.0/ })).toBeDefined()
+  await ui.pointer({ type: 'up', x: X(5), y: 1, button: 'left', in: 'timeline' })
+  expect(ran.find(a => a.includes('move'))?.slice(2)).toEqual(['timeline', 'move', '#outro', '3', '--json'])
+
+  // drag the clip's own end edge in: a trim
+  await ui.post({ op: 'commit', kind: 'trim-end', id: 'intro', start: 0, end: 3.5 }, { in: 'timeline' })
+  expect(ran.filter(a => a.includes('trim')).pop()?.slice(2)).toEqual(['timeline', 'trim', '#intro', '--end', '3.5', '--json'])
 
   // a click that only delivers its up still selects
   await ui.pointer({ type: 'up', x: X(1), y: 1, button: 'left', in: 'timeline' })

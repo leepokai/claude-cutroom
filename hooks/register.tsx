@@ -581,6 +581,9 @@ const TRACK_ORDER = ['video', 'graphics', 'captions', 'audio']
 
 // ---------- the timeline: one track, cut by time ----------
 
+// a clip being dragged (moved or trimmed) and where it would be, drawn before the release commits it
+let dragPreview: { id: string; start: number; end: number } | null = null
+
 const nice = (id: string) => {
   const s = id.replace(/[-_](layer|comp|composition|clip|scene)$/i, '').replace(/[-_]+/g, ' ')
   return s.charAt(0).toUpperCase() + s.slice(1)
@@ -601,7 +604,7 @@ function segmentsOf(clips: HfClip[], duration: number): Segment[] {
     const id = cover?.id ?? `gap-${i}`
     const last = out[out.length - 1]
     if (last && last.id === id) last.end = b
-    else out.push({ id, label: cover ? nice(cover.id) : 'Empty', start: a, end: b })
+    else out.push({ id, label: cover ? nice(cover.id) : 'Empty', start: a, end: b, clipStart: cover?.absStart ?? a, clipEnd: cover?.absEnd ?? b })
   }
   return out
 }
@@ -900,7 +903,9 @@ export const register: Register = on => {
     // key badges help in a terminal; on the desktop they are clutter
     const hk = (key: string) => (e.surface === 'terminal' ? { hotkey: key } : {})
 
-    const segs = segmentsOf(clips, duration)
+    const dp = dragPreview
+    const shown = dp ? clips.map(c => (c.id === dp.id ? { ...c, absStart: dp.start, absEnd: dp.end } : c)) : clips
+    const segs = segmentsOf(shown, duration)
     let timelineEl: JSX.Element
     if (e.surface === 'desktop') {
       const { Svg } = $.ui.resolve(e)
@@ -997,6 +1002,30 @@ export const register: Register = on => {
     const c = tl?.clips.find(x => x.id === m.id)
     if (m.op === 'toggle') {
       await togglePlay($)
+      return {}
+    }
+    const n = (k: string) => (typeof (m as Record<string, unknown>)[k] === 'number' ? ((m as Record<string, unknown>)[k] as number) : null)
+    if (m.op === 'drag' && c) {
+      const start = n('start')
+      const end = n('end')
+      if (start === null || end === null) return {}
+      dragPreview = { id: c.id, start, end }
+      await update($, selected, () => c.id)
+      await seek($, dir, n('show') ?? start) // the preview shows the frame at the edge being dragged
+      $.ui.invalidate('ui.render')
+      return {}
+    }
+    if (m.op === 'commit' && c) {
+      const start = n('start') ?? c.absStart
+      const end = n('end') ?? c.absEnd
+      const kind = (m as { kind?: string }).kind
+      const args =
+        kind === 'move' ? ['move', c.ref, fmt(start)]
+        : kind === 'trim-start' ? ['trim', c.ref, '--start', fmt(start), '--end', fmt(end)]
+        : ['trim', c.ref, '--end', fmt(end)]
+      await edit($, dir, kind === 'move' ? 'move' : 'trim', args) // the reloaded timeline replaces the preview
+      dragPreview = null
+      $.ui.invalidate('ui.render')
       return {}
     }
     if (typeof m.t === 'number') await seek($, dir, m.t)
