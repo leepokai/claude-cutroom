@@ -21,7 +21,7 @@ import path from 'node:path'
 const cfg = JSON.parse(process.argv[2] ?? '{}')
 const W = cfg.width ?? 854
 const H = cfg.height ?? 480
-const QUALITY = cfg.quality ?? 60
+let QUALITY = cfg.quality ?? 72 // lowered on the fly when a frame would outgrow the pane's Svg cap
 const children = []
 let shuttingDown = false
 
@@ -197,13 +197,21 @@ await load()
 // ---------- 4. frames ----------
 
 let frame = { seq: 0, jpeg: null }
+const MAX_JPEG = 110_000 // base64 chars; the desktop Svg that shows a frame holds 131072
 onEvent('Page.screencastFrame', p => {
   frame = { seq: frame.seq + 1, jpeg: p.data }
   void cdp('Page.screencastFrameAck', { sessionId: p.sessionId }).catch(() => {})
+  if (p.data.length > MAX_JPEG && QUALITY > 35) {
+    // real footage compresses worse than flat graphics: step the quality down and restart the cast
+    QUALITY -= 10
+    void cdp('Page.stopScreencast').then(startScreencast).catch(() => {})
+  }
 })
 const startScreencast = () =>
   cdp('Page.startScreencast', { format: 'jpeg', quality: QUALITY, maxWidth: W, maxHeight: H, everyNthFrame: 1 })
 await startScreencast()
+// a paused page sends no new frame: nudge it so the first one is the styled player
+await evaluate(`(async () => { const p = ${PLAYER}; const t = p.currentTime || 0; await p.seek(t + 0.04); await p.seek(t) })()`).catch(() => {})
 
 const playerState = () => evaluate(`(() => { const p = ${PLAYER}; return p ? { t: p.currentTime, d: p.duration, paused: p.paused } : null })()`)
 
@@ -248,6 +256,23 @@ async function command(cmd) {
       await mkdir(path.dirname(cmd.path), { recursive: true })
       await writeFile(cmd.path, Buffer.from(frame.jpeg, 'base64'))
       break
+    case 'strip': {
+      // n small frames spread over the timeline, for the clip thumbnails; the player is left where it was
+      const s = await playerState()
+      const n = Math.max(1, Math.min(24, Number(cmd.n) || 12))
+      const w = Math.max(48, Math.min(320, Number(cmd.w) || 160))
+      const d = s?.d ?? 0
+      await evaluate(`${PLAYER}.pause()`)
+      const frames = []
+      for (let i = 0; i < n; i++) {
+        await evaluate(`${PLAYER}.seek(${((i + 0.5) * d) / n})`)
+        await evaluate('new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))')
+        const shot = await cdp('Page.captureScreenshot', { format: 'jpeg', quality: 55, clip: { x: 0, y: 0, width: W, height: H, scale: w / W } })
+        frames.push(shot.data)
+      }
+      await evaluate(`${PLAYER}.seek(${s?.t ?? 0})`)
+      return { ...(await playerState()), frames }
+    }
     default:
       throw new Error(`unknown op ${cmd.op}`)
   }
@@ -276,6 +301,12 @@ const server = http.createServer(async (req, res) => {
         }
       }
       return send(200, out)
+    }
+    if (req.method === 'GET' && url.pathname === '/cmd') {
+      // the same commands as a query string, for hosts whose fetch sends no body
+      const cmd = Object.fromEntries(url.searchParams)
+      for (const k of ['t', 'n', 'w']) if (k in cmd) cmd[k] = Number(cmd[k])
+      return send(200, { ok: true, state: await command(cmd) })
     }
     if (req.method === 'POST' && url.pathname === '/cmd') {
       let body = ''

@@ -1,24 +1,22 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { HfClip, HfPreview, HfSelection, HfStudio, HfTimeline } from '../types'
+import type { HfClip, HfPreview, HfTimeline } from '../types'
+import type { Segment, TimelineGeo, TimelineProps } from './timeline'
 
-// Cutroom: a cutting-room pane for HyperFrames projects.
+// Cutroom: a CapCut-style cutting room for HyperFrames projects, inside Claude Code.
 //
-// The picture lives in three places at once: HyperFrames Studio in the browser
-// (full fidelity), a *live player* in this pane (player/cutroom-player.mjs plays
-// the composition in headless Chrome and streams its frames: an Svg on the
-// desktop app, kitty pixels or half-block cells in a terminal), and a snapshot
-// path Claude can read. Studio's selection and
-// time are polled into the pane and attached to every prompt the person types,
-// so "make this bigger" needs no further pointing. Cuts are the HyperFrames
-// CLI's own `timeline` verbs; everything else goes to Claude.
+// Self-contained: no HyperFrames Studio. A live player (player/cutroom-player.mjs)
+// plays the composition in headless Chrome and streams its frames into the pane
+// (an Svg on the desktop app, kitty pixels or half-block cells in a terminal).
+// Cuts are the HyperFrames CLI's own `timeline` verbs; everything else goes to
+// Claude, with the selected clip, the playhead and a snapshot attached.
 
 const PANE = 'cutroom'
 const WORK = '.hyperframes/cutroom'
 const RGB_W = 192 // width of the raw strip the terminal thumbnail is built from
-const LIVE_W = 854 // the live player's viewport
-const LIVE_H = 480
+const LIVE_W = 1280 // the live player's viewport
+const LIVE_H = 720
 
 const project = atom({ plugin: 'cutroom', key: 'project' } as const, null as string | null)
 const candidates = atom({ plugin: 'cutroom', key: 'candidates' } as const, [] as string[])
@@ -26,12 +24,9 @@ const timeline = atom({ plugin: 'cutroom', key: 'timeline' } as const, null as H
 const selected = atom({ plugin: 'cutroom', key: 'selected' } as const, null as string | null)
 const playhead = atom({ plugin: 'cutroom', key: 'playhead' } as const, 0)
 const preview = atom({ plugin: 'cutroom', key: 'preview' } as const, null as HfPreview)
-const studio = atom({ plugin: 'cutroom', key: 'studio' } as const, null as HfStudio)
-const selection = atom({ plugin: 'cutroom', key: 'selection' } as const, null as HfSelection)
 const status = atom({ plugin: 'cutroom', key: 'status' } as const, '')
 const busy = atom({ plugin: 'cutroom', key: 'busy' } as const, '')
 const receipts = atom({ plugin: 'cutroom', key: 'receipts' } as const, [] as string[])
-const autoContext = atom({ plugin: 'cutroom', key: 'autoContext' } as const, true)
 const live = atom({ plugin: 'cutroom', key: 'live' } as const, null as { port: number; duration: number } | null)
 
 type Eng = EngineInterface
@@ -41,7 +36,13 @@ type Json = any
 const fmt = (n: number) => String(Math.round(n * 100) / 100)
 const base = (p: string) => p.replace(/\/+$/, '').split('/').pop() || p
 const tail = (s: string, n = 200) => s.trim().slice(-n)
-const say = ($: Eng, text: string) => update($, status, () => text)
+let sayTimer: { cancel: () => void } | undefined
+/** a status line that clears itself after a few seconds */
+const say = ($: Eng, text: string) => {
+  sayTimer?.cancel()
+  if (text) sayTimer = $.clock.after(6000, () => void update($, status, () => '').catch(() => undefined))
+  return update($, status, () => text)
+}
 const working = ($: Eng, text: string) => update($, busy, () => text)
 // background work outlives a hot reload or a test; its late writes are refused and dropped
 const quiet = () => undefined
@@ -109,7 +110,7 @@ async function findProjects($: Eng, cwd: string): Promise<string[]> {
   return found
 }
 
-async function openProject($: Eng, dir: string, openBrowser: boolean) {
+async function openProject($: Eng, dir: string) {
   const clean = dir.replace(/\/+$/, '')
   if (!(await isProject($, clean))) return say($, `not a HyperFrames project: ${clean}`)
   stopLive()
@@ -117,14 +118,11 @@ async function openProject($: Eng, dir: string, openBrowser: boolean) {
   await update($, project, () => clean)
   await update($, selected, () => null)
   await update($, preview, () => null)
-  await update($, studio, () => null)
-  await update($, selection, () => null)
-  await update($, receipts, () => [])
   await update($, playhead, () => 0)
+  await update($, receipts, () => [])
   await $.store.set(`last:${await $.session.cwd()}`, clean)
-  await say($, `opened ${base(clean)}`)
+  await say($, '')
   await loadTimeline($, clean)
-  await ensureStudio($, clean, openBrowser)
   void capture($, clean, 0).catch(quiet) // a poster frame while the live player starts
   void startLive($, clean).catch(quiet)
 }
@@ -156,87 +154,8 @@ async function loadTimeline($: Eng, dir: string) {
 
 async function refresh($: Eng, dir: string) {
   await loadTimeline($, dir)
-  if (!(await liveCmd($, { op: 'reload' }))) void capture($, dir, await read($, playhead)).catch(quiet)
-}
-
-// ---------- Studio: server, browser, live selection ----------
-
-let pollTimer: { cancel: () => void } | undefined
-let pollFailures = 0
-let lastSelectionAt: string | null | undefined
-
-const studioOf = (st: Json): HfStudio =>
-  st?.result?.state === 'running' && st.result.serverUrl
-    ? {
-        serverUrl: String(st.result.serverUrl),
-        studioUrl: String(st.result.studioUrl ?? `${st.result.serverUrl}/`).replace('127.0.0.1', 'localhost'),
-        projectName: String(st.result.projectName ?? ''),
-      }
-    : null
-
-async function ensureStudio($: Eng, dir: string, openBrowser: boolean) {
-  let srv = studioOf(json((await run($, dir, ['preview', '--status', '--json'])).stdout))
-  if (!srv) {
-    await working($, 'starting Studio…')
-    const r = await run($, dir, ['preview', '--background', ...(openBrowser ? [] : ['--no-open'])], 90_000)
-    srv = studioOf(json((await run($, dir, ['preview', '--status', '--json'])).stdout))
-    await working($, '')
-    if (!srv) return say($, `Studio did not start: ${tail(r.stderr || r.stdout)}`)
-  } else if (openBrowser) {
-    await openUrl($, srv.studioUrl)
-  }
-  await update($, studio, () => srv)
-  startPolling($, dir)
-}
-
-async function openUrl($: Eng, url: string) {
-  const mac = await $.process.run(['open', url]).catch(() => ({ exitCode: 1 }))
-  if (mac.exitCode !== 0) await $.process.run(['xdg-open', url]).catch(() => undefined)
-}
-
-function startPolling($: Eng, dir: string) {
-  pollTimer?.cancel()
-  pollFailures = 0
-  lastSelectionAt = undefined
-  pollTimer = $.clock.every(1500, () => void pollSelection($, dir).catch(quiet))
-}
-
-async function pollSelection($: Eng, dir: string) {
-  const srv = await read($, studio)
-  if (!srv) return pollTimer?.cancel()
-  const url = `${srv.serverUrl}/api/projects/${encodeURIComponent(srv.projectName)}/selection`
-  const r = await $.http.fetch(url).catch(() => null)
-  if (!r?.ok) {
-    if (++pollFailures >= 3) {
-      pollTimer?.cancel()
-      await update($, studio, () => null)
-      await say($, 'Studio stopped — press Open Studio to start it again')
-    }
-    return
-  }
-  pollFailures = 0
-  const j = json(r.text)
-  const updatedAt: string | null = j?.updatedAt ?? null
-  if (updatedAt === lastSelectionAt) return
-  lastSelectionAt = updatedAt
-  const s = j?.selection
-  if (!s) return update($, selection, () => null)
-  const sel: HfSelection = {
-    id: s.target?.id ?? null,
-    hfId: s.target?.hfId ?? null,
-    selector: s.target?.selector ?? null,
-    file: s.sourceFile ?? s.compositionPath ?? null,
-    label: s.label ?? null,
-    text: typeof s.textContent === 'string' ? s.textContent.replace(/\s+/g, ' ').trim().slice(0, 120) : null,
-    time: typeof s.currentTime === 'number' ? s.currentTime : null,
-    updatedAt,
-  }
-  await update($, selection, () => sel)
-  const tl = await read($, timeline)
-  const clip = tl?.clips.find(c => c.id === sel.id) ?? tl?.clips.find(c => sel.file !== null && c.src === sel.file)
-  if (clip) await update($, selected, () => clip.id)
-  if (sel.time !== null) await seek($, dir, sel.time)
-  await say($, `Studio: ${sel.label ?? sel.id ?? sel.selector ?? 'selection'}`)
+  if (await liveCmd($, { op: 'reload' })) void loadStrip($).catch(quiet)
+  else void capture($, dir, await read($, playhead)).catch(quiet)
 }
 
 // ---------- frame preview ----------
@@ -309,15 +228,9 @@ function scheduleCapture($: Eng, dir: string, at: number) {
   captureTimer = $.clock.after(500, () => void capture($, dir, at).catch(quiet))
 }
 
-/** Grabs the frame at `at`: Studio's thumbnail API when the server runs (~0.5 s), else `hyperframes snapshot` (~4 s). */
+/** Grabs the frame at `at` with `hyperframes snapshot` (~4 s); the poster before the live player is up. */
 async function grabFrame($: Eng, dir: string, at: number, out: string): Promise<string | null> {
-  const srv = await read($, studio)
   const full = `${out}/frame.png`
-  if (srv) {
-    const url = `${srv.serverUrl}/api/projects/${encodeURIComponent(srv.projectName)}/thumbnail/index.html?t=${fmt(at)}&format=png&output=source`
-    const r = await $.process.run(['curl', '-sf', '--max-time', '20', '-o', full, url], { timeoutMs: 25_000 }).catch(() => ({ exitCode: 1 }))
-    if (r.exitCode === 0) return full
-  }
   const r = await run($, dir, ['snapshot', '--at', fmt(at), '--no-end', '--describe', 'false', '-o', out])
   const frames = (await $.fs.list(out).catch(() => []))
     .filter(f => /^frame-\d+-at-.*\.png$/.test(f.name))
@@ -395,11 +308,13 @@ async function startLive($: Eng, dir: string) {
   const config = { project: dir, hf: await hf($), width: LIVE_W, height: LIVE_H }
   const stream = $.process.spawn({ argv: ['node', `${$.plugin.root}/player/cutroom-player.mjs`, JSON.stringify(config)], cwd: dir })
   liveStream = stream
-  await working($, 'starting the live player…')
+  await working($, 'Starting preview…')
   let head = ''
+  let lastErr = ''
   try {
     for await (const { stream: pipe, text } of stream) {
       if (pipe === 'stderr') {
+        lastErr = text.trim().slice(-200) || lastErr
         $.ui.log(text.trim().slice(0, 300), { to: 'debug' })
         continue
       }
@@ -410,31 +325,76 @@ async function startLive($: Eng, dir: string) {
       const first = json(head.slice(0, nl))
       await working($, '')
       if (!first?.port) {
-        await say($, `live player failed: ${first?.error ?? head.slice(0, 200)} — frames fall back to stills`)
+        await say($, `Preview didn't start: ${first?.error ?? head.slice(0, 200)} (showing stills)`)
         continue
       }
       livePort = Number(first.port)
       await update($, live, () => ({ port: livePort, duration: Number(first.duration ?? 0) }))
       await liveCmd($, { op: 'seek', t: await read($, playhead) })
-      liveTimer = $.clock.every(100, () => void pollLive($).catch(quiet))
+      liveTimer = $.clock.every(30, () => void pollLive($).catch(quiet)) // ~33 fps; a poll in flight skips the next
+      void loadStrip($).catch(quiet)
     }
   } catch (err) {
-    if (liveStream === stream) await say($, `live player stopped: ${String(err).slice(0, 200)}`)
+    if (liveStream === stream) await say($, `Preview stopped: ${String(err).slice(0, 200)}`)
   }
   if (liveStream === stream) {
+    if (lastErr) await say($, `Preview stopped: ${lastErr}`)
     stopLive()
     await update($, live, () => null)
     await working($, '')
   }
 }
 
-async function liveCmd($: Eng, cmd: { op: string; t?: number; path?: string }): Promise<boolean> {
-  if (!livePort) return false
-  const r = await $.http
-    .fetch(`http://127.0.0.1:${livePort}/cmd`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(cmd) })
-    .catch(() => null)
-  return Boolean(r?.ok)
+async function liveCall($: Eng, cmd: { op: string; t?: number; path?: string; n?: number; w?: number }): Promise<Json> {
+  if (!livePort) return null
+  const q = new URLSearchParams(Object.entries(cmd).map(([k, v]) => [k, String(v)]))
+  const r = await $.http.fetch(`http://127.0.0.1:${livePort}/cmd?${q}`).catch(() => null)
+  return r?.ok ? (json(r.text) ?? {}) : null
 }
+const liveCmd = async ($: Eng, cmd: { op: string; t?: number; path?: string }) => (await liveCall($, cmd)) !== null
+
+// the desktop redraws a pane ten times a second at most: every redraw carries the frames that arrived
+// since the last one, and the Svg flips through them itself (SMIL), so playback runs at the player's rate
+const FLIP_BUDGET = 120_000 // base64 chars of frames per Svg; the Svg holds 131072
+const FLIP_SPAN = 0.1 // seconds one redraw's frames are spread over
+let flip: string[] = []
+
+/** the frames to show this redraw, newest last, as many as fit the budget (always the newest) */
+function takeFlip(): string[] {
+  const out: string[] = []
+  let size = 0
+  for (let i = flip.length - 1; i >= 0; i--) {
+    const f = flip[i] ?? ''
+    if (out.length && size + f.length > FLIP_BUDGET) break
+    out.unshift(f)
+    size += f.length
+  }
+  flip = []
+  return out
+}
+
+/** one Svg that shows `frames` in turn over FLIP_SPAN and holds the last */
+function flipbookSvg(w: number, h: number, frames: string[]) {
+  const dt = FLIP_SPAN / frames.length
+  const img = (f: string, i: number) => {
+    // each frame shows from its slot on; the next one, drawn on top, covers it
+    return `<image href="data:image/jpeg;base64,${f}" width="${w}" height="${h}"${i === 0 ? '' : ' visibility="hidden"'}>${i === 0 ? '' : `<set attributeName="visibility" to="visible" begin="${(i * dt).toFixed(3)}s" fill="freeze"/>`}</image>`
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">${frames.map(img).join('')}</svg>`
+}
+
+// thumbnails for the timeline: STRIP_N frames spread over the whole composition
+const STRIP_N = 10
+let strip: string[] = []
+async function loadStrip($: Eng) {
+  const j = await liveCall($, { op: 'strip', n: STRIP_N, w: 320 })
+  const frames = j?.state?.frames
+  if (Array.isArray(frames) && frames.every(f => typeof f === 'string')) {
+    strip = frames
+    $.ui.invalidate('ui.render')
+  }
+}
+
 
 async function pollLive($: Eng) {
   if (!livePort || liveInflight) return
@@ -451,6 +411,8 @@ async function pollLive($: Eng) {
     if (typeof j.jpeg === 'string') {
       liveSeq = Number(j.seq)
       liveFrame = { seq: liveSeq, jpeg: j.jpeg, rgb: typeof j.rgb === 'string' ? j.rgb : null, rgbW: Number(j.rgbW ?? 0), rgbH: Number(j.rgbH ?? 0) }
+      flip.push(j.jpeg)
+      if (flip.length > 8) flip.shift()
       $.ui.invalidate('ui.render')
     } else if (moved || wasPaused !== livePaused) $.ui.invalidate('ui.render')
     if (livePaused && (moved || !wasPaused)) await update($, playhead, () => t)
@@ -460,7 +422,9 @@ async function pollLive($: Eng) {
 }
 
 async function togglePlay($: Eng) {
-  if (!(await liveCmd($, { op: 'toggle' }))) await say($, 'the live player is not running — /cut starts it')
+  const d = (await read($, timeline))?.duration ?? 0
+  if (livePaused && d > 0 && liveT >= d - 0.05) await liveCmd($, { op: 'seek', t: 0 }) // at the end: play from the top
+  if (!(await liveCmd($, { op: 'toggle' }))) await say($, 'Preview is not running. Run /cut again.')
 }
 
 function rgbToRgba(rgb: Uint8Array): string {
@@ -504,31 +468,44 @@ async function edit($: Eng, dir: string, label: string, args: string[]) {
     await $.fs.write(path, JSON.stringify(j.receipt))
     await update($, receipts, list => [...list, path].slice(-30))
   }
-  await say($, `${label} ✓`)
+  await say($, `${label} done`)
   await refresh($, dir)
 }
-
-async function withClip($: Eng, fn: (clip: HfClip, t: number) => Promise<void>) {
-  const [tl, sel, t] = await Promise.all([read($, timeline), read($, selected), read($, playhead)])
-  const clip = tl?.clips.find(c => c.id === sel)
-  if (!clip) return say($, 'select a clip first (click it in Studio, or press its row or number here)')
-  await fn(clip, t)
-}
-
-const inside = (clip: HfClip, t: number) => t > clip.absStart && t < clip.absEnd
 
 async function undoLast($: Eng, dir: string) {
   const list = await read($, receipts)
   const last = list[list.length - 1]
-  if (!last) return say($, 'nothing to undo here (Studio has its own Undo for edits made there)')
+  if (!last) return say($, 'Nothing to undo')
   await working($, 'undo…')
   const r = await run($, dir, ['timeline', 'undo', last, '--json'])
   const j = json(r.stdout)
   await working($, '')
   if (!j?.ok) return say($, `undo failed: ${j?.error?.message ?? tail(r.stderr || r.stdout)}`)
   await update($, receipts, l => l.slice(0, -1))
-  await say($, 'undo ✓')
+  await say($, 'undo done')
   await refresh($, dir)
+}
+
+// ---------- upload ----------
+
+/** the system's file dialog (macOS; zenity elsewhere) → the file copied into <project>/assets → Claude places it */
+async function upload($: Eng, dir: string) {
+  await working($, 'Choose a file…')
+  const mac = await $.process
+    .run(['osascript', '-e', 'POSIX path of (choose file with prompt "Add media to the video")'], { timeoutMs: 600_000 })
+    .catch(() => null)
+  const pick = mac ?? (await $.process.run(['zenity', '--file-selection', '--title=Add media to the video'], { timeoutMs: 600_000 }).catch(() => null))
+  await working($, '')
+  const src = pick?.exitCode === 0 ? pick.stdout.trim() : ''
+  if (!src) return say($, 'Upload cancelled')
+  const name = (src.split('/').pop() ?? 'media').replace(/[^\w.\-]+/g, '-')
+  await $.process.run(['mkdir', '-p', `${dir}/assets`])
+  const cp = await $.process.run(['cp', src, `${dir}/assets/${name}`])
+  if (cp.exitCode !== 0) return say($, `Upload failed: ${tail(cp.stderr)}`)
+  pendingRefresh = true
+  const at = livePort && !livePaused ? liveT : await read($, playhead)
+  await say($, `Added assets/${name}`)
+  void $.prompt.submit({ text: `Add the uploaded file assets/${name} to the video, starting at the playhead (${fmt(at)}s).\n\n${await contextBlock($, dir)}` })
 }
 
 // ---------- check / render ----------
@@ -541,7 +518,7 @@ async function check($: Eng, dir: string) {
   const issues: Json[] = Array.isArray(j?.issues) ? j.issues : Array.isArray(j?.findings) ? j.findings : []
   const errors = issues.filter(i => i?.severity === 'error').length
   const counts = issues.length ? ` · ${errors} error(s), ${issues.length - errors} other finding(s)` : ''
-  await say($, r.exitCode === 0 ? `check passed${counts}` : `check failed (exit ${r.exitCode})${counts} — ask Claude: "fix the check findings"`)
+  await say($, r.exitCode === 0 ? `check passed${counts}` : `check failed (exit ${r.exitCode})${counts}. Ask Claude to fix the findings.`)
 }
 
 async function renderDraft($: Eng, dir: string) {
@@ -563,28 +540,16 @@ async function renderDraft($: Eng, dir: string) {
 let pendingRefresh = false
 
 async function contextBlock($: Eng, dir: string): Promise<string> {
-  const [t, tl, selId, sel, pv, srv] = await Promise.all([
-    read($, playhead),
-    read($, timeline),
-    read($, selected),
-    read($, selection),
-    read($, preview),
-    read($, studio),
-  ])
+  const [t, tl, selId, pv] = await Promise.all([read($, playhead), read($, timeline), read($, selected), read($, preview)])
   const clip = tl?.clips.find(c => c.id === selId)
-  const lines: string[] = [
-    `[Cutroom] The person is editing the HyperFrames project at ${dir}${srv ? ` with Studio open at ${srv.studioUrl}` : ''}.`,
-  ]
-  if (sel) {
-    lines.push(
-      `Studio selection ("this" / 這個 / 這段 means it): ${sel.label ?? ''} ${sel.selector ?? ''}${sel.hfId ? ` data-hf-id=${sel.hfId}` : ''}${sel.file ? ` in ${sel.file}` : ''}${sel.text ? ` — text "${sel.text}"` : ''}`.replace(/\s+/g, ' '),
-    )
-  }
-  if (clip) {
-    lines.push(
-      `Selected clip: ${clip.id} on the ${clip.trackKind} track, ${fmt(clip.absStart)}–${fmt(clip.absEnd)}s, declared in ${clip.file}${clip.src ? ` (src ${clip.src})` : ''}.`,
-    )
-  } else if (!sel) lines.push('Nothing is selected.')
+  const lines: string[] = [`[Cutroom] The person is editing the HyperFrames project at ${dir} in the Cutroom pane.`]
+  const seg = clip && tl ? segmentsOf(tl.clips, tl.duration).find(g => g.id === clip.id) : undefined
+  if (seg) lines.push(`Selected segment ("this" / 這個 / 這段 means it): ${fmt(seg.start)}–${fmt(seg.end)}s of the video, shown as "${seg.label}".`)
+  lines.push(
+    clip
+      ? `Its clip: ${clip.id} on the ${clip.trackKind} track, ${fmt(clip.absStart)}–${fmt(clip.absEnd)}s, declared in ${clip.file}${clip.src ? ` (src ${clip.src})` : ''}.`
+      : 'Nothing is selected.',
+  )
   const still = `${dir}/${WORK}/live.jpg`
   const shot = (await liveCmd($, { op: 'save', path: still })) ? still : pv?.png
   lines.push(`Playhead: ${fmt(livePort && !livePaused ? liveT : t)}s.${shot ? ` A snapshot of that frame is at ${shot} (Read it to see the picture).` : ''}`)
@@ -594,34 +559,115 @@ async function contextBlock($: Eng, dir: string): Promise<string> {
     )
   }
   lines.push(
-    'Before editing composition files load the hyperframes skill (and hyperframes-core; hyperframes-keyframes for motion, hyperframes-audio for sound). Use `hyperframes timeline <verb>` for cuts and `hyperframes snapshot --at <t>` to look at any other frame. Change only what the person named, run `hyperframes lint` afterwards, and keep the reply to one or two sentences. Studio reloads by itself.',
+    'Before editing composition files load the hyperframes skill (and hyperframes-core; hyperframes-keyframes for motion, hyperframes-audio for sound). Use `hyperframes timeline <verb>` for cuts and `hyperframes snapshot --at <t>` to look at any other frame. Change only what the person named, run `hyperframes lint` afterwards, and keep the reply to one or two sentences. The Cutroom pane reloads by itself.',
   )
   return lines.join('\n')
 }
 
-async function askClaude($: Eng, dir: string, request: string) {
-  pendingRefresh = true
-  await say($, `sent to Claude: ${request.slice(0, 70)}`)
-  void $.prompt.submit({ text: `${request}\n\n${await contextBlock($, dir)}` })
-}
-
 // ---------- drawing helpers ----------
 
-function bar(width: number, duration: number, s: number, e: number, t: number) {
-  const d = duration > 0 ? duration : 1
-  const cells: string[] = []
-  for (let i = 0; i < width; i++) {
-    const a = (i / width) * d
-    const b = ((i + 1) / width) * d
-    cells.push(e > a && s < b ? '█' : '·')
-  }
-  const p = Math.min(width - 1, Math.max(0, Math.floor((t / d) * width)))
-  cells[p] = '┃'
-  return cells.join('')
+/** 3.25 → "00:03.2" */
+const clock = (n: number) => {
+  const v = Math.max(0, n)
+  const m = Math.floor(v / 60)
+  return `${String(m).padStart(2, '0')}:${(v - m * 60).toFixed(1).padStart(4, '0')}`
+}
+const pct = (n: number, d: number) => `${Math.round(Math.max(0, Math.min(100, d > 0 ? (n / d) * 100 : 0)))}%` // the engine takes whole percentages
+
+// a CapCut-like dark editor; one colour per track kind
+// Anthropic's palette: warm slate neutrals, ivory text, Claude's clay as the one accent
+const UI = { bg: '#1f1e1d', panel: '#262624', lane: '#30302e', text: '#f0eee6', dim: '#a6a39a', accent: '#d97757', head: '#faf9f5', black: '#141413' }
+const TRACK_ORDER = ['video', 'graphics', 'captions', 'audio']
+
+// ---------- the timeline: one track, cut by time ----------
+
+const nice = (id: string) => {
+  const s = id.replace(/[-_](layer|comp|composition|clip|scene)$/i, '').replace(/[-_]+/g, ' ')
+  return s.charAt(0).toUpperCase() + s.slice(1)
 }
 
-const pad = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s.padEnd(n))
-const TRACK_ORDER = ['video', 'graphics', 'captions', 'audio']
+/** every clip edge is a cut; each piece is named for the shortest clip covering it (the most specific content there) */
+function segmentsOf(clips: HfClip[], duration: number): Segment[] {
+  const d = duration
+  const cuts = [...new Set([0, d, ...clips.flatMap(c => [c.absStart, c.absEnd])].filter(x => x >= 0 && x <= d))].sort((a, b) => a - b)
+  const out: Segment[] = []
+  for (let i = 0; i + 1 < cuts.length; i++) {
+    const a = cuts[i] ?? 0
+    const b = cuts[i + 1] ?? d
+    if (b - a < 0.05) continue
+    const cover = clips
+      .filter(c => c.absStart <= a + 1e-6 && c.absEnd >= b - 1e-6)
+      .sort((x, y) => x.absEnd - x.absStart - (y.absEnd - y.absStart) || TRACK_ORDER.indexOf(x.trackKind) - TRACK_ORDER.indexOf(y.trackKind))[0]
+    const id = cover?.id ?? `gap-${i}`
+    const last = out[out.length - 1]
+    if (last && last.id === id) last.end = b
+    else out.push({ id, label: cover ? nice(cover.id) : 'Empty', start: a, end: b })
+  }
+  return out
+}
+
+const TL = { inset: 2, ruler: 26, track: 84, radius: 10, gap: 3 }
+const esc = (s: string) => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c] ?? c)
+
+/** the track as one Svg document (real frames inside each segment), plus the geometry the pointer overlay maps against */
+// the track's Svg is the heaviest string in a redraw: rebuild it only when something drawn in it changes
+// (the playhead on a 0.1 s grid), not on every live frame
+let svgCache: { key: string; value: ReturnType<typeof buildTimelineSvg> } | null = null
+function timelineSvg(width: number, duration: number, t: number, selected: string | null, segs: Segment[], frames: string[]) {
+  const key = `${width}|${duration}|${Math.round(t * 10)}|${selected}|${frames.length}|${frames[0]?.length ?? 0}|${segs.map(g => `${g.id}:${g.start}:${g.end}`).join(',')}`
+  if (svgCache?.key !== key || svgCache.value.frames !== frames) svgCache = { key, value: buildTimelineSvg(width, duration, t, selected, segs, frames) }
+  return svgCache.value
+}
+function buildTimelineSvg(width: number, duration: number, t: number, selected: string | null, segs: Segment[], frames: string[]) {
+  const d = duration > 0 ? duration : 1
+  const w = width - 2 * TL.inset
+  const height = TL.ruler + TL.track + 4
+  const x = (s: number) => TL.inset + (Math.max(0, Math.min(d, s)) / d) * w
+  const y = TL.ruler
+  const slot = w / Math.max(1, frames.length)
+  const out: string[] = [
+    `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" font-family="-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,sans-serif">`,
+    '<defs>',
+    ...frames.map((f, i) => `<image id="f${i}" width="${slot + 1}" height="${TL.track}" preserveAspectRatio="xMidYMid slice" href="data:image/jpeg;base64,${f}" xlink:href="data:image/jpeg;base64,${f}"/>`),
+    `<linearGradient id="shade" x1="0" y1="0" x2="0" y2="1"><stop offset=".45" stop-color="${UI.black}" stop-opacity="0"/><stop offset="1" stop-color="${UI.black}" stop-opacity=".78"/></linearGradient>`,
+    '</defs>',
+  ]
+  // ruler: a tick a second (labelled every quarter)
+  const step = d <= 12 ? 1 : d <= 60 ? 5 : 15
+  for (let s = 0; s <= d + 1e-6; s += step) out.push(`<line x1="${x(s)}" y1="${y - 7}" x2="${x(s)}" y2="${y - 3}" stroke="#5e5d59"/>`)
+  for (let i = 0; i <= 4; i++) {
+    const s = (d * i) / 4
+    out.push(`<text x="${x(s)}" y="${y - 11}" fill="${UI.dim}" font-size="11" text-anchor="${i === 0 ? 'start' : i === 4 ? 'end' : 'middle'}">${fmt(s)}s</text>`)
+  }
+  out.push(`<rect x="${TL.inset}" y="${y}" width="${w}" height="${TL.track}" rx="${TL.radius}" fill="${UI.lane}"/>`)
+  segs.forEach((g, gi) => {
+    const x0 = x(g.start) + (gi === 0 ? 0 : TL.gap / 2)
+    const x1 = x(g.end) - (gi === segs.length - 1 ? 0 : TL.gap / 2)
+    const sw = Math.max(4, x1 - x0)
+    const id = `s${gi}`
+    out.push(`<clipPath id="${id}"><rect x="${x0}" y="${y}" width="${sw}" height="${TL.track}" rx="${TL.radius}"/></clipPath><g clip-path="url(#${id})">`)
+    out.push(`<rect x="${x0}" y="${y}" width="${sw}" height="${TL.track}" fill="${UI.panel}"/>`)
+    frames.forEach((_, i) => {
+      const fs = ((i + 0.5) * d) / frames.length
+      if (x(fs) + slot / 2 < x0 || x(fs) - slot / 2 > x1) return
+      out.push(`<use href="#f${i}" xlink:href="#f${i}" x="${x(fs) - slot / 2}" y="${y}"/>`)
+    })
+    out.push(`<rect x="${x0}" y="${y}" width="${sw}" height="${TL.track}" fill="url(#shade)"/>`)
+    if (sw > 54) {
+      out.push(`<text x="${x0 + 10}" y="${y + TL.track - 12}" fill="${UI.head}" font-size="12.5" font-weight="600">${esc(g.label)}</text>`)
+      if (sw > 120) out.push(`<text x="${x1 - 10}" y="${y + TL.track - 12}" fill="${UI.head}" fill-opacity=".7" font-size="11" text-anchor="end">${fmt(g.end - g.start)}s</text>`)
+    }
+    out.push('</g>')
+    const isSel = g.id === selected
+    out.push(`<rect x="${x0 + 1}" y="${y + 1}" width="${sw - 2}" height="${TL.track - 2}" rx="${TL.radius - 1}" fill="none" stroke="${isSel ? UI.accent : 'rgba(240,238,230,.10)'}" stroke-width="${isSel ? 2.5 : 1}"/>`)
+  })
+  const px = x(t)
+  out.push(`<line x1="${px}" y1="${y - 6}" x2="${px}" y2="${y + TL.track + 3}" stroke="${UI.head}" stroke-width="2" stroke-linecap="round"/>`)
+  out.push(`<circle cx="${px}" cy="${y - 7}" r="4.5" fill="${UI.head}"/>`)
+  out.push('</svg>')
+  const geo: TimelineGeo = { inset: TL.inset / width, ruler: TL.ruler / height }
+  return { source: out.join(''), height, geo, frames }
+}
 
 // ---------- register ----------
 
@@ -631,7 +677,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'cut',
-      description: 'Cutroom: HyperFrames cutting-room pane — frame preview, Studio sync, trim/split/move, ask Claude to edit',
+      description: 'Cutroom: live preview and a draggable timeline for a HyperFrames project',
       argumentHint: '[project-dir]',
     })
     const [termProgram, kitty, ghostty] = await Promise.all([
@@ -643,16 +689,15 @@ export const register: Register = on => {
     const started = await next(e)
     const open = await read($, project)
     if (open) {
-      // a reload: keep the Studio link and the live selection alive, and redraw the frame
+      // a reload: redraw the timeline and restart the player
       void (async () => {
-        await ensureStudio($, open, false)
         await refresh($, open)
         await startLive($, open)
       })().catch(quiet)
     } else if (e.isInteractive && (await $.fs.exists(`${e.cwd}/hyperframes.json`))) {
       void (async () => {
         await $.ui.open({ id: PANE, title: 'Cutroom', columns: 100, rows: 24 })
-        await openProject($, e.cwd, false)
+        await openProject($, e.cwd)
       })().catch(quiet)
     }
     return started
@@ -666,37 +711,37 @@ export const register: Register = on => {
     await $.ui.open({ id: PANE, title: 'Cutroom', focus: true, columns: 100, rows: 24 })
     if (arg) {
       const dir = arg.startsWith('/') ? arg : `${cwd}/${arg}`
-      await openProject($, dir, true)
+      await openProject($, dir)
       return { text: `Cutroom: ${dir}` }
     }
     const current = await read($, project)
     if (current) {
-      await ensureStudio($, current, true)
+      if (!livePort) void startLive($, current).catch(quiet)
       return { text: `Cutroom: ${current}` }
     }
     const last = await $.store.get(`last:${cwd}`)
     if (typeof last === 'string' && (await isProject($, last))) {
-      await openProject($, last, true)
+      await openProject($, last)
       return { text: `Cutroom: ${last}` }
     }
     const found = await findProjects($, cwd)
     await update($, candidates, () => found)
     const only = found[0]
     if (found.length === 1 && only) {
-      await openProject($, only, true)
+      await openProject($, only)
       return { text: `Cutroom: ${only}` }
     }
     return {
       text: found.length
-        ? `Cutroom: ${found.length} projects found — pick one in the pane`
+        ? `Cutroom: ${found.length} projects found, pick one in the pane`
         : 'Cutroom: no project under this directory. Run /cut <project-dir>',
     }
   })
 
-  // what the person types in the normal prompt carries the Studio selection and the playhead
+  // what the person types in the normal prompt carries the selected clip and the playhead
   on('prompt.submit', async ($, e, next) => {
     const dir = await read($, project)
-    if (!dir || e.origin.kind !== 'composer' || !(await read($, autoContext))) return next(e)
+    if (!dir || e.origin.kind !== 'composer') return next(e)
     pendingRefresh = true
     return next({ ...e, context: [...(e.context ?? []), await contextBlock($, dir)] })
   })
@@ -712,37 +757,33 @@ export const register: Register = on => {
   })
 
   on('ui.close', { id: PANE }, async ($, e, next) => {
-    pollTimer?.cancel()
     stopLive()
     await update($, live, () => null)
     return next(e)
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    if (e.surface === 'mobile') {
+    if (e.surface !== 'terminal' && e.surface !== 'desktop') {
       const { Box, Text } = $.ui.resolve(e)
       return (
         <Box>
-          <Text dimColor>Cutroom needs the terminal or desktop surface.</Text>
+          <Text dimColor>Cutroom needs the terminal or the desktop app.</Text>
         </Box>
       )
     }
-    const { Box, Text, Button, Input, Link } = $.ui.resolve(e)
+    const { Box, Text, Button, Client } = $.ui.resolve(e)
     const width = Math.max(48, e.props.bodyColumns - 1)
-    const [dir, tl, selId, t0, pv, srv, sel, msg, job, rc, cands, ctxOn, lv] = await Promise.all([
+    const [dir, tl, selId, t0, pv, msg, job, cands, lv, rc] = await Promise.all([
       read($, project),
       read($, timeline),
       read($, selected),
       read($, playhead),
       read($, preview),
-      read($, studio),
-      read($, selection),
       read($, status),
       read($, busy),
-      read($, receipts),
       read($, candidates),
-      read($, autoContext),
       read($, live),
+      read($, receipts),
     ])
 
     if (!dir) {
@@ -752,7 +793,7 @@ export const register: Register = on => {
           {cands.length > 0 ? (
             <Text dimColor>Pick a project:</Text>
           ) : (
-            <Text dimColor>No HyperFrames project under this directory. Run /cut &lt;project-dir&gt;.</Text>
+            <Text dimColor>No HyperFrames project here. Run /cut &lt;project-dir&gt;.</Text>
           )}
           {cands.map((c, i) => (
             <Button
@@ -760,7 +801,7 @@ export const register: Register = on => {
               plain
               {...(i < 9 ? { hotkey: String(i + 1) } : {})}
               label={c}
-              onPress={() => void openProject($, c, true)}
+              onPress={() => void openProject($, c)}
             />
           ))}
           {msg !== '' && <Text dimColor>{msg}</Text>}
@@ -775,6 +816,7 @@ export const register: Register = on => {
     const isPlaying = isLive && !livePaused
     const t = isPlaying ? liveT : t0
 
+    const deskW = Math.max(240, Math.min(LIVE_W, Math.round(e.props.bodyColumns * 7.2) - 24))
     // the frame: the live player's latest (Svg on the desktop, kitty pixels or half-block
     // cells in a terminal), else the last still
     let frame: JSX.Element
@@ -790,11 +832,12 @@ export const register: Register = on => {
     }
     if (isLive && liveFrame && e.surface !== 'terminal') {
       const { Svg } = $.ui.resolve(e)
-      const svgW = Math.max(240, Math.min(LIVE_W, Math.round(e.props.bodyColumns * 7.2)))
+      const svgW = deskW
       const svgH = Math.round((svgW * LIVE_H) / LIVE_W)
+      const frames = isPlaying ? takeFlip() : []
       frame = (
         <Svg
-          source={`<svg xmlns="http://www.w3.org/2000/svg" width="${svgW}" height="${svgH}" viewBox="0 0 ${svgW} ${svgH}"><image href="data:image/jpeg;base64,${liveFrame.jpeg}" width="${svgW}" height="${svgH}"/></svg>`}
+          source={frames.length > 1 ? flipbookSvg(svgW, svgH, frames) : `<svg xmlns="http://www.w3.org/2000/svg" width="${svgW}" height="${svgH}" viewBox="0 0 ${svgW} ${svgH}"><image href="data:image/jpeg;base64,${frames[0] ?? liveFrame.jpeg}" width="${svgW}" height="${svgH}"/></svg>`}
           alt={`live @ ${fmt(t)}s`}
           width={svgW}
           height={svgH}
@@ -811,7 +854,7 @@ export const register: Register = on => {
         frame = <Raster key="frame" columns={liveCols} rows={liveRows} cells={rasterCells(bytes, liveFrame.rgbW, liveFrame.rgbH, liveCols, liveRows)} />
       }
     } else if (!pv || !pv.rgb) {
-      frame = <Text dimColor>{job || 'no frame yet — press ⟳ (r)'}</Text>
+      frame = <Text color={UI.dim}>{job || 'Loading preview…'}</Text>
     } else if (e.surface === 'terminal') {
       const inline = e.props.placement === 'inline'
       if (hasPixels) {
@@ -841,7 +884,7 @@ export const register: Register = on => {
       const b64 = await cachedBase64($, pv.jpg, pv.gen)
       const png = await cachedBase64($, pv.png, pv.gen)
       const { width: w0, height: h0 } = pngSize(png)
-      const svgW = 480
+      const svgW = deskW
       const svgH = Math.max(1, Math.round((svgW * h0) / w0))
       frame = (
         <Svg
@@ -853,137 +896,111 @@ export const register: Register = on => {
       )
     }
 
-    // compact clip list, grouped by track kind
-    const kinds = [...TRACK_ORDER.filter(k => clips.some(c => c.trackKind === k)), ...clips.map(c => c.trackKind).filter(k => !TRACK_ORDER.includes(k))].filter(
-      (k, i, all) => all.indexOf(k) === i,
-    )
-    const barW = Math.max(10, width - 36)
-    let n = 0
-    const rows = kinds.map(kind => (
-      <Box flexDirection="column">
-        <Text dimColor>{kind}</Text>
-        {clips
-          .filter(c => c.trackKind === kind)
-          .map(c => {
-            const i = n++
-            const isSel = c.id === selId
-            return (
-              <Box>
-                <Text bold={isSel}>{isSel ? '▸' : ' '}</Text>
-                <Button
-                  key={`clip:${c.id}`}
-                  plain
-                  dimColor={!isSel}
-                  {...(i < 9 ? { hotkey: String(i + 1) } : {})}
-                  label={pad(c.id, 15)}
-                  onPress={() => void selectClip($, dir, c)}
-                />
-                <Text dimColor={!isSel}> {bar(barW, duration, c.absStart, c.absEnd, t)} </Text>
-                <Text dimColor>
-                  {fmt(c.absStart)}–{fmt(c.absEnd)}
-                </Text>
-              </Box>
-            )
-          })}
-      </Box>
-    ))
-
     const go = (to: number) => () => void seek($, dir, to)
-    const op = (label: string, args: (clip: HfClip, t: number) => string[] | string) => () =>
-      void withClip($, async (c, at) => {
-        const a = args(c, at)
-        if (typeof a === 'string') {
-          await say($, a)
-          return
-        }
-        await edit($, dir, label, a)
-      })
+    // key badges help in a terminal; on the desktop they are clutter
+    const hk = (key: string) => (e.surface === 'terminal' ? { hotkey: key } : {})
 
-    const where = sel
-      ? `Studio: ${sel.label ?? sel.id ?? sel.selector ?? '?'}${sel.file ? ` · ${sel.file}` : ''}${clip && clip.id !== sel.id ? ` · in clip ${clip.id}` : ''}`
-      : clip
-        ? `clip ${clip.id} · ${fmt(clip.absStart)}–${fmt(clip.absEnd)}s · ${clip.file}${clip.src ? ` · ${clip.src}` : ''}`
-        : 'nothing selected — click something in Studio, or a row below'
+    const segs = segmentsOf(clips, duration)
+    let timelineEl: JSX.Element
+    if (e.surface === 'desktop') {
+      const { Svg } = $.ui.resolve(e)
+      let svg = timelineSvg(deskW, duration, t, selId, segs, strip)
+      if (svg.source.length > 130_000) svg = timelineSvg(deskW, duration, t, selId, segs, []) // too big with frames
+      const props: TimelineProps = { mode: 'overlay', duration, t, selected: selId, segments: segs, geo: svg.geo }
+      timelineEl = (
+        <Box position="relative" alignSelf="flex-start">
+          <Svg source={svg.source} alt={`timeline: ${segs.map(g => g.label).join(', ')}`} width={deskW} height={svg.height} />
+          <Box position="absolute" top={0} left={0} width="100%" height="100%">
+            <Client key="timeline" module="./timeline.tsx" props={props} width="100%" height="100%" />
+          </Box>
+        </Box>
+      )
+    } else {
+      const props: TimelineProps = { mode: 'text', duration, t, selected: selId, segments: segs }
+      timelineEl = <Client key="timeline" module="./timeline.tsx" props={props} width="100%" height={3} />
+    }
+    const seg = segs.find(g => g.id === selId)
+    const target = seg ?? segs.find(g => t >= g.start && t < g.end)
+    const tclip = clips.find(c => c.id === target?.id)
+    const cut = (label: string, args: (c: HfClip) => string[] | string) => () => {
+      if (!tclip) return void say($, 'Click a segment first')
+      const a = args(tclip)
+      void (typeof a === 'string' ? say($, a) : edit($, dir, label, a))
+    }
+    const inside = (c: HfClip) => t > c.absStart + 0.02 && t < c.absEnd - 0.02
+    const NOT_INSIDE = 'Move the playhead inside the segment first'
 
     return (
-      <Box flexDirection="column">
-        <Box gap={1}>
-          <Text bold>{base(dir)}</Text>
-          <Text dimColor>
-            · {fmt(duration)}s · {isLive ? 'live ●' : 'stills'} · Studio {srv ? '●' : '○'}
+      <Box flexDirection="column" backgroundColor={UI.bg} paddingX={1} gap={1}>
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center">
+          <Box gap={1}>
+            <Text bold color={UI.text}>
+              {base(dir)}
+            </Text>
+            <Text color={UI.dim}>{fmt(duration)}s</Text>
+          </Box>
+          <Box gap={1}>
+            <Button key="upload" {...hk('n')} variant="secondary" label="Upload" onPress={() => void upload($, dir)} />
+            <Button key="render" {...hk('v')} variant="primary" label="Export" onPress={() => void renderDraft($, dir)} />
+          </Box>
+        </Box>
+
+        <Box justifyContent="center" backgroundColor={UI.black}>
+          <Box position="relative">
+            {frame}
+            <Box position="absolute" top={0} left={0} width="100%" height="100%">
+              <Client key="tap" module="./tap.tsx" props={null} width="100%" height="100%" />
+            </Box>
+          </Box>
+        </Box>
+
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center">
+          <Text color={UI.text}>
+            {clock(t)} <Text color={UI.dim}>/ {clock(duration)}</Text>
           </Text>
-          <Button key="studio-open" plain hotkey="g" label={srv ? '[open Studio ↗]' : '[start Studio]'} onPress={() => void ensureStudio($, dir, true)} />
-          {srv !== null && <Link href={srv.studioUrl} label={srv.studioUrl.replace(/^https?:\/\//, '')} />}
+          <Box gap={2} alignItems="center">
+            <Button key="seek-start" plain {...hk('a')} label="⏮" onPress={go(clip ? clip.absStart : 0)} />
+            <Button key="seek-m1" plain {...hk('j')} label="−1s" onPress={go(t - 1)} />
+            <Button key="play" plain {...hk('p')} label={isPlaying ? '❚❚' : '▶'} onPress={() => void togglePlay($)} />
+            <Button key="seek-p1" plain {...hk('k')} label="+1s" onPress={go(t + 1)} />
+            <Button key="seek-end" plain {...hk('f')} label="⏭" onPress={go(clip ? clip.absEnd - 0.05 : duration)} />
+          </Box>
+          <Text color={isLive ? UI.accent : UI.dim}>{isLive ? '● Live' : '○ Still'}</Text>
         </Box>
-        {frame}
-        <Box gap={1}>
-          <Button key="play" plain hotkey="p" label={isPlaying ? '❚❚' : '▶'} onPress={() => void togglePlay($)} />
-          <Button key="seek-start" plain hotkey="a" label="|◀" onPress={go(clip ? clip.absStart : 0)} />
-          <Button key="seek-m1" plain hotkey="j" label="-1s" onPress={go(t - 1)} />
-          <Button key="seek-m01" plain hotkey="h" label="-.1" onPress={go(t - 0.1)} />
-          <Text bold> {fmt(t)}s </Text>
-          <Button key="seek-p01" plain hotkey="l" label="+.1" onPress={go(t + 0.1)} />
-          <Button key="seek-p1" plain hotkey="k" label="+1s" onPress={go(t + 1)} />
-          <Button key="seek-end" plain hotkey="f" label="▶|" onPress={go(clip ? clip.absEnd - 0.05 : duration)} />
-          <Button key="refresh" plain hotkey="r" label="⟳" onPress={() => void capture($, dir, t)} />
-          <Input
-            key="goto"
-            placeholder="t="
-            submitLabel="seek"
-            onSubmit={v => {
-              const num = Number(v)
-              if (Number.isFinite(num)) void seek($, dir, num)
-            }}
-          />
+
+        <Box flexDirection="row" gap={1} alignItems="center">
+          <Button key="split" {...hk('s')} variant="secondary" label="✂ Split" onPress={cut('split', c => (inside(c) ? ['split', c.ref, fmt(t)] : NOT_INSIDE))} />
+          <Button key="trim-in" {...hk('i')} variant="secondary" label="⇤ Trim start" onPress={cut('trim start', c => (inside(c) ? ['trim', c.ref, '--start', fmt(t), '--end', fmt(c.absEnd)] : NOT_INSIDE))} />
+          <Button key="trim-out" {...hk('o')} variant="secondary" label="Trim end ⇥" onPress={cut('trim end', c => (inside(c) ? ['trim', c.ref, '--end', fmt(t)] : NOT_INSIDE))} />
+          <Button key="delete" {...hk('x')} variant="secondary" label="Delete" onPress={cut('delete', c => ['delete', c.ref])} />
+          <Box flexGrow={1} />
+          <Button key="undo" {...hk('u')} variant="secondary" label={`↶ Undo${rc.length ? ` (${rc.length})` : ''}`} onPress={() => void undoLast($, dir)} />
         </Box>
-        <Text dimColor>{where}</Text>
-        <Box gap={1} flexWrap="wrap">
-          <Button
-            key="trim-in"
-            hotkey="i"
-            label="Trim in→┃"
-            onPress={op('trim in', (c, at) => (inside(c, at) ? ['trim', c.ref, '--start', fmt(at), '--end', fmt(c.absEnd)] : 'move the playhead inside the clip first'))}
-          />
-          <Button
-            key="trim-out"
-            hotkey="o"
-            label="┃←Trim out"
-            onPress={op('trim out', (c, at) => (inside(c, at) ? ['trim', c.ref, '--end', fmt(at)] : 'move the playhead inside the clip first'))}
-          />
-          <Button
-            key="split"
-            hotkey="s"
-            label="Split @┃"
-            onPress={op('split', (c, at) => (inside(c, at) ? ['split', c.ref, fmt(at)] : 'move the playhead inside the clip first'))}
-          />
-          <Button key="move" hotkey="m" label="Move→┃" onPress={op('move', (c, at) => ['move', c.ref, fmt(at)])} />
-          <Button key="dup" hotkey="d" label="Duplicate" onPress={op('duplicate', c => ['duplicate', c.ref])} />
-          <Button key="delete" hotkey="x" label="Delete" onPress={op('delete', c => ['delete', c.ref])} />
-          <Button key="undo" hotkey="u" label={`Undo (${rc.length})`} onPress={() => void undoLast($, dir)} />
-          <Button key="check" hotkey="c" label="Check" onPress={() => void check($, dir)} />
-          <Button key="render" hotkey="v" label="Render draft" onPress={() => void renderDraft($, dir)} />
-          <Button key="reload" hotkey="z" label="Reload" onPress={() => void refresh($, dir)} />
-          <Button
-            key="ctx"
-            plain
-            hotkey="t"
-            dimColor={!ctxOn}
-            label={`prompt context: ${ctxOn ? 'on' : 'off'}`}
-            onPress={() => void update($, autoContext, v => !v)}
-          />
-        </Box>
-        <Input
-          key="ask"
-          label="Ask Claude ›"
-          placeholder="change what? e.g. 把這段標題放大、進場再慢一點 (or just type in the main prompt)"
-          submitLabel="send"
-          onSubmit={v => {
-            if (v.trim()) void askClaude($, dir, v.trim())
-          }}
-        />
-        <Text dimColor>{job || msg}</Text>
-        <Box flexDirection="column">{rows}</Box>
+        {timelineEl}
+
+        <Text color={UI.dim}>
+          {job ||
+            [seg ? `${seg.label}, ${fmt(seg.start)}-${fmt(seg.end)}s selected. Tell Claude what to change.` : 'Click a segment to select it, drag to scrub. Tell Claude what to change.', msg]
+              .filter(Boolean)
+              .join('  ·  ')}
+        </Text>
       </Box>
     )
+  })
+
+  // the timeline Client posts what the pointer did
+  on('ui.message', { requestId: PANE }, async ($, e) => {
+    const dir = await read($, project)
+    const m = e.data as { op?: string; t?: number; id?: string; start?: number } | null
+    if (!dir || !m) return {}
+    const tl = await read($, timeline)
+    const c = tl?.clips.find(x => x.id === m.id)
+    if (m.op === 'toggle') {
+      await togglePlay($)
+      return {}
+    }
+    if (typeof m.t === 'number') await seek($, dir, m.t)
+    if (m.op === 'press') await update($, selected, () => (c ? c.id : null))
+    return {}
   })
 }
